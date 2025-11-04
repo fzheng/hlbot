@@ -4,53 +4,34 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Hyperliquid BTC Perp Tracker</title>
-    <style>
-      :root {
-        --bg: #0f1218;
-        --fg: #e6e6e6;
-        --muted: #a0a7b4;
-        --accent: #2ec4b6;
-        --warn: #ff9f1a;
-        --bad: #ff4d4f;
-        --good: #2ecc71;
-      }
-      body {
-        margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica Neue, Arial, "Apple Color Emoji", "Segoe UI Emoji";
-        background: var(--bg); color: var(--fg);
-      }
-      .wrap { max-width: 920px; margin: 32px auto; padding: 0 16px; }
-      h1 { font-size: 20px; margin: 0 0 16px; }
-      .card { background: #151a23; border: 1px solid #202736; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-      input[type=text] { width: 360px; padding: 8px 10px; border-radius: 6px; border: 1px solid #2a3142; background: #0d1117; color: var(--fg); }
-      button { padding: 8px 12px; border-radius: 6px; border: 1px solid #2a3142; background: #1b2130; color: var(--fg); cursor: pointer; margin-left: 8px; }
-      button:hover { border-color: #39445c; }
-      table { width: 100%; border-collapse: collapse; }
-      th, td { padding: 8px; border-bottom: 1px solid #252c3c; text-align: left; }
-      th { color: var(--muted); font-weight: 600; }
-      .muted { color: var(--muted); }
-      .score { font-weight: 600; }
-      .score.positive { color: var(--good); }
-      .score.negative { color: var(--bad); }
-      .small { font-size: 12px; }
-      .row { display: flex; gap: 8px; align-items: center; }
-    </style>
+    <meta name="theme-color" content="#0f1218" />
+    <link rel="preload" href="/styles.css" as="style" />
+    <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <div class="wrap">
-      <h1>Hyperliquid BTC Perp Tracker</h1>
+      <header class="site-header">
+        <h1>Hyperliquid BTC Perp Tracker</h1>
+        <div class="small muted">Live BTC perp address monitoring</div>
+      </header>
 
-      <div class="card">
-        <div class="row">
-          <input id="addrInput" type="text" placeholder="Enter Hyperliquid address (0x...)" />
-          <button id="addBtn">Add address</button>
-          <span id="addMsg" class="muted small"></span>
+      <div class="card" aria-labelledby="addressEntryTitle">
+        <div class="row" style="align-items:flex-start;">
+          <div style="display:flex; flex-direction:column; gap:6px;">
+            <label class="small muted" id="addressEntryTitle" for="addrInput">Add a Hyperliquid address</label>
+            <div class="row">
+              <input id="addrInput" type="text" placeholder="0x..." autocomplete="off" inputmode="text" aria-label="Hyperliquid address" />
+              <button id="addBtn" aria-label="Add address to tracking list">Add address</button>
+            </div>
+            <span id="addMsg" class="muted small" role="status" aria-live="polite"></span>
+          </div>
         </div>
       </div>
 
-      <div class="card">
-        <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px;">
-          <h3 style="margin:0">Tracked addresses</h3>
-          <button id="pollNowBtn" title="Trigger an immediate server poll">Refresh now</button>
+      <div class="card" aria-labelledby="trackedAddressesTitle">
+        <div class="flex space-between mb-2" style="align-items:center; gap:8px;">
+          <h3 id="trackedAddressesTitle" style="margin:0">Tracked addresses</h3>
+          <button id="pollNowBtn" title="Trigger an immediate server poll" aria-label="Manually refresh now">Refresh now</button>
         </div>
         <table>
           <thead>
@@ -60,9 +41,9 @@
         </table>
       </div>
 
-      <div class="card">
-        <h3 style="margin:0 0 8px">Recommendations</h3>
-        <div id="recs"></div>
+      <div class="card" aria-labelledby="recommendationsTitle">
+        <h3 id="recommendationsTitle" style="margin:0 0 8px">Recommendations</h3>
+        <div id="recs" aria-live="polite"></div>
         <div class="muted small" id="lastUpdated"></div>
       </div>
     </div>
@@ -177,27 +158,17 @@
       }
 
       // Modal for holdings
-      const modal = document.createElement('div');
-      modal.style.position = 'fixed';
-      modal.style.inset = '0';
-      modal.style.display = 'none';
-      modal.style.background = 'rgba(0,0,0,0.5)';
-      modal.style.alignItems = 'center';
-      modal.style.justifyContent = 'center';
-      const modalCard = document.createElement('div');
-      modalCard.style.background = '#11161f';
-      modalCard.style.border = '1px solid #2a3142';
-      modalCard.style.borderRadius = '8px';
-      modalCard.style.padding = '16px';
-      modalCard.style.width = '520px';
-      modalCard.style.maxWidth = '90vw';
-      modalCard.innerHTML = '<div class="row" style="justify-content:space-between;"><strong>Perp holdings</strong><button id="modalClose">Close</button></div><div id="modalBody" class="small" style="margin-top:8px;"></div>';
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  const modalCard = document.createElement('div');
+  modalCard.className = 'modal-card';
+  modalCard.innerHTML = '<div class="row" style="justify-content:space-between; align-items:center; margin-bottom:8px;"><strong>Perp holdings</strong><button id="modalClose" aria-label="Close holdings modal">Close</button></div><div id="modalBody" class="small"></div>';
       modal.appendChild(modalCard);
       document.body.appendChild(modal);
       document.getElementById('modalClose').addEventListener('click', () => { modal.style.display = 'none'; });
 
       async function showHoldings(address) {
-        modal.style.display = 'flex';
+  modal.style.display = 'flex';
         const body = modal.querySelector('#modalBody');
         body.textContent = 'Loading...';
         try {
