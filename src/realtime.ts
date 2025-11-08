@@ -172,7 +172,7 @@ export class RealtimeTracker {
     }
   }
 
-  private onUserEvents(addr: Address, evt: any) {
+  private async onUserEvents(addr: Address, evt: any) {
     try {
       // We care about FillEvent variant: { fills: [...] }
       if (!evt || !('fills' in evt)) return;
@@ -208,6 +208,20 @@ export class RealtimeTracker {
           else actionLabel = newPos === 0 ? 'Close Short' : 'Decrease Short';
         }
 
+        const persistencePayload = {
+          at,
+          address: addr,
+          symbol: 'BTC',
+          action: actionLabel,
+          size: Math.abs(sz),
+          startPosition,
+          priceUsd: px,
+          realizedPnlUsd: Number.isFinite(realizedPnl) ? realizedPnl : null,
+          fee,
+          feeToken,
+          hash,
+        };
+        const persistResult = await insertTradeIfNew(addr, persistencePayload);
         const evt = this.q.push({
           type: 'trade',
           at,
@@ -224,9 +238,8 @@ export class RealtimeTracker {
           feeToken,
           hash,
           action: actionLabel,
+          dbId: persistResult.id ?? undefined,
         });
-        // Prefer dedup/upsert by tx hash to allow later aggregated backfills to overwrite partial WS slices
-        void insertTradeIfNew(addr, evt);
       }
     } catch (e) {
       // eslint-disable-next-line no-console

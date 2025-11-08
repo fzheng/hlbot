@@ -4,7 +4,7 @@
 
 Single‑tenant Hyperliquid BTC perp tracker with real‑time fills & positions, time‑based pagination, and a minimal responsive UI.
 
-> NOTE: The legacy recommendation & poller system has been removed. Trade pagination now uses timestamps (`beforeAt`) instead of numeric id cursors.
+> NOTE: The legacy recommendation & poller system has been removed. Trade pagination now uses a timestamp+id cursor (`beforeAt` + `beforeId`) for strict chronological ordering.
 
 ## Quick Start
 
@@ -96,7 +96,7 @@ Positions & Price:
 - `GET /api/price` – current BTC price snapshot
 
 Trades:
-- `GET /api/latest-trades?limit=200&beforeAt=<ISO>&address=<0x...>` → `{ trades, nextBeforeAt }`
+- `GET /api/latest-trades?limit=200&beforeAt=<ISO>&beforeId=<int>&address=<0x...>` → `{ trades, nextCursor }`
 - `GET /api/user-trades/:address` – recent fills direct from Info API (not paginated)
 - `POST /api/backfill` `{ address?: string|null, limit?: number }` – light recent fills ingestion
 - `POST /api/clear-all-trades` – destructive wipe of all stored trades
@@ -144,7 +144,7 @@ Heartbeat: server pings every 30s; unresponsive clients are terminated.
 Adaptive broadcast interval: 1000ms (≤10 clients), 500ms (≤25), 250ms (>25).
 
 ## Pagination Strategy
-Trades are ordered by `at desc, id desc`. Cursor = the last trade's ISO timestamp → supply as `beforeAt` to fetch older pages. This prevents misordering that can occur with pure id‑based pagination when inserts are slightly out of chronological order.
+Trades are ordered by `at desc, id desc`. Cursor = `{ beforeAt, beforeId }` from the last trade in a page. Supplying both ensures that fills sharing the exact same millisecond timestamp remain reachable while still preventing misordering that pure id-based pagination can introduce.
 
 ## Refresh & Clear Workflow
 UI buttons:

@@ -51,16 +51,26 @@
       </div>
 
       <div class="card" aria-labelledby="tradesTitle">
-        <div class="flex space-between mb-2" style="align-items:center; gap:8px;">
+        <div class="flex space-between mb-2 trades-header">
           <h3 id="tradesTitle" style="margin:0">BTC Fills (All Tracked)</h3>
-          <div class="row">
-            <label class="small muted" for="timeModeSel">Time</label>
-            <select id="timeModeSel">
-              <option value="absolute">Absolute</option>
-              <option value="relative" selected>Relative</option>
-            </select>
-            <button id="clearAllBtn" aria-label="Delete all stored trades without backfilling">🗑️ Clear</button>
-            <button id="refreshAllBtn" class="btn-primary" aria-label="Clear all stored trades then fetch fresh fills for all addresses">🔄 Refresh All</button>
+          <div class="trades-controls">
+            <div class="control-field">
+              <label class="small muted" for="timeModeSel">Time</label>
+              <select id="timeModeSel">
+                <option value="absolute">Absolute</option>
+                <option value="relative" selected>Relative</option>
+              </select>
+            </div>
+            <div class="control-field grow">
+              <label class="small muted" for="tradesAddressFilter">Address</label>
+              <select id="tradesAddressFilter" aria-label="Filter fills by address">
+                <option value="">All addresses</option>
+              </select>
+            </div>
+            <div class="control-actions">
+              <button id="clearAllBtn" aria-label="Delete all stored trades without backfilling">🗑️ Clear</button>
+              <button id="refreshAllBtn" class="btn-primary" aria-label="Clear all stored trades then fetch fresh fills for all addresses">🔄 Refresh All</button>
+            </div>
           </div>
         </div>
         <table style="width:100%;">
@@ -87,6 +97,7 @@
       const addMsg = document.getElementById('addMsg');
       const positionsTbody = document.getElementById('positionsTbody');
       const tradesTbody = document.getElementById('tradesTbody');
+      const tradesAddressFilter = document.getElementById('tradesAddressFilter');
   const refreshAllBtn = document.getElementById('refreshAllBtn');
   const clearAllBtn = document.getElementById('clearAllBtn');
   // Infinite scroll sentinel
@@ -100,7 +111,7 @@
       const ipInfoLink = document.getElementById('ipInfoLink');
       let posSort = { key: 'updated', dir: 'desc' };
       let tradeSort = { key: 'time', dir: 'desc' };
-  let tradesState = { items: [], nextBeforeAt: null, loadingMore: false, observer: null, rate: { lastAt: 0 } };
+  let tradesState = { items: [], nextCursor: null, loadingMore: false, observer: null, rate: { lastAt: 0 }, latestSeq: 0, addressFilter: '' };
       // Toast system
       const toastContainer = document.createElement('div');
       toastContainer.className = 'toast-container';
@@ -115,26 +126,145 @@
         setTimeout(close, opts.ttl || 4200);
       }
       let nickMap = {};
+      let knownAddresses = [];
       let timeMode = 'relative';
   let refreshing = false;
+      let relativeTimeTimer = null;
+
+      const normalizeAddress = (addr) => (typeof addr === 'string' ? addr.trim().toLowerCase() : '');
+
+      async function refreshNicknames() {
+        try {
+          const r = await fetch('/api/addresses');
+          const data = await r.json();
+          const addrList = Array.isArray(data.addresses) ? data.addresses : [];
+          const nicknames = data.nicknames || {};
+          const normalizedBook = {};
+          Object.keys(nicknames).forEach((key) => {
+            const norm = normalizeAddress(key);
+            if (norm) normalizedBook[norm] = String(nicknames[key]);
+          });
+          nickMap = normalizedBook;
+          const seen = new Set();
+          knownAddresses = [];
+          addrList.forEach((addr) => {
+            const display = String(addr || '').trim();
+            const norm = normalizeAddress(display);
+            if (!norm || seen.has(norm)) return;
+            seen.add(norm);
+            knownAddresses.push({ value: norm, label: display });
+          });
+          renderAddressFilterOptions();
+          renderTrades(tradesState.items);
+        } catch (e) {
+          console.warn('failed to refresh nicknames', e);
+        }
+      }
+
+      function renderAddressFilterOptions() {
+        if (!tradesAddressFilter) return;
+        const current = tradesState.addressFilter || '';
+        const exists = !current || knownAddresses.some((entry) => entry.value === current);
+        tradesAddressFilter.innerHTML = '';
+        const defaultOpt = document.createElement('option');
+        defaultOpt.value = '';
+        defaultOpt.textContent = 'All addresses';
+        tradesAddressFilter.appendChild(defaultOpt);
+        knownAddresses.forEach(({ value, label }) => {
+          const opt = document.createElement('option');
+          opt.value = value;
+          const nick = nickMap[value];
+          opt.textContent = nick ? `${nick} (${label})` : label || value;
+          tradesAddressFilter.appendChild(opt);
+        });
+        tradesAddressFilter.value = exists ? current : '';
+        if (!exists && current) {
+          tradesState.addressFilter = '';
+          tradesAddressFilter.value = '';
+          void loadInitialTrades(300);
+        }
+      }
 
       async function fetchPositions() {
         const r = await fetch('/api/current-positions');
         return (await r.json()).positions || [];
       }
 
-      async function fetchAllTrades(limit = 1000, beforeAt = null) {
+      async function fetchAllTrades(limit = 1000, cursor = null, address = null) {
         const url = new URL('/api/latest-trades', location.origin);
         url.searchParams.set('limit', limit);
-        if (beforeAt) url.searchParams.set('beforeAt', beforeAt);
+        if (cursor?.beforeAt) url.searchParams.set('beforeAt', cursor.beforeAt);
+        if (cursor?.beforeId != null) url.searchParams.set('beforeId', cursor.beforeId);
+        if (address) url.searchParams.set('address', address);
         const r = await fetch(url.toString());
         const j = await r.json();
-        return { trades: j.trades || [], nextBeforeAt: j.nextBeforeAt || null };
+        const nextCursor = j.nextCursor || (j.nextBeforeAt ? { beforeAt: j.nextBeforeAt, beforeId: j.nextBeforeId ?? null } : null);
+        return { trades: j.trades || [], nextCursor };
       }
 
       async function fetchPrice() {
         const r = await fetch('/api/price');
         return await r.json();
+      }
+
+      async function loadInitialTrades(limit = 300) {
+        if (!tradeSentinel) return;
+        tradesState.loadingMore = true;
+        tradeSentinel.classList.add('loading');
+        tradeSentinel.innerHTML = '<span class="small muted">Loading fills…</span>';
+        showSkeletonRows();
+        try {
+          const { trades, nextCursor } = await fetchAllTrades(limit, null, tradesState.addressFilter || null);
+          tradesState.items = trades;
+          tradesState.nextCursor = nextCursor;
+          renderTrades(tradesState.items);
+          updateTradeSentinelIdle();
+          initInfiniteScroll();
+        } catch (e) {
+          console.error('initial trades load failed', e);
+          showToast('Failed to load fills', { type: 'error' });
+        } finally {
+          tradesState.loadingMore = false;
+          tradeSentinel.classList.remove('loading');
+          removeSkeletonRows();
+        }
+      }
+
+      function updateTradeSentinelIdle() {
+        if (!tradeSentinel) return;
+        if (tradesState.nextCursor) {
+          tradeSentinel.innerHTML = '<span class="small muted">Loading more…</span>';
+          return;
+        }
+        const suffix = tradesState.addressFilter ? ' for this address' : '';
+        if (tradesState.items.length === 0) {
+          tradeSentinel.innerHTML = `<span class="small muted">No fills${suffix}</span>`;
+        } else {
+          tradeSentinel.innerHTML = `<span class="small muted">No more fills${suffix}</span>`;
+        }
+      }
+
+      function refreshRelativeTradeTimes() {
+        if (timeMode !== 'relative') return;
+        document.querySelectorAll('td.trade-time[data-time]').forEach((td) => {
+          const iso = td.getAttribute('data-time');
+          if (iso) td.textContent = formatTime(iso);
+        });
+      }
+
+      function ensureRelativeTimeTicker() {
+        if (relativeTimeTimer) return;
+        relativeTimeTimer = setInterval(() => {
+          refreshRelativeTradeTimes();
+        }, 30000);
+      }
+      ensureRelativeTimeTicker();
+
+      async function applyAddressFilter(value) {
+        const normalized = normalizeAddress(value);
+        if (tradesState.addressFilter === normalized) return;
+        tradesState.addressFilter = normalized;
+        await loadInitialTrades(300);
       }
 
       function renderPositions(positions) {
@@ -169,8 +299,8 @@
             <td class="small muted">${formatTime(p.updatedAt)}</td>
           `;
           tr.querySelector('a[data-address]')?.addEventListener('click', (e) => { e.preventDefault(); showHoldings(p.address); });
-          tr.querySelector('a[data-action="remove"]')?.addEventListener('click', async (e) => { e.preventDefault(); await removeAddress(p.address); await refresh(); });
-          tr.querySelector('a[data-action="edit-nick"]')?.addEventListener('click', async (e) => { e.preventDefault(); await editNickname(p.address, p.nickname || ''); await refresh(); });
+          tr.querySelector('a[data-action="remove"]')?.addEventListener('click', async (e) => { e.preventDefault(); await removeAddress(p.address); await refresh(); await refreshNicknames(); });
+          tr.querySelector('a[data-action="edit-nick"]')?.addEventListener('click', async (e) => { e.preventDefault(); await editNickname(p.address, p.nickname || ''); await refresh(); await refreshNicknames(); });
           // Add external Hyperbot link in actions
           (function(){ return;
             const actions = tr.querySelector('td .small');
@@ -198,10 +328,14 @@
           const pnl = (typeof t.closedPnl === 'number' && isFinite(t.closedPnl)) ? t.closedPnl : null;
           const pnlTxt = pnl !== null ? formatUsd(pnl) : '-';
           const pnlClass = pnl !== null ? (pnl >= 0 ? 'score positive' : 'score negative') : '';
-          const nick = nickMap && nickMap[t.address] ? String(nickMap[t.address]) : '';
-          const addrHtml = nick ? (`<strong>${escapeHtml(nick)}</strong><div class="small muted">${t.address}</div>`) : `<span class="addr">${t.address}</span>`;
+          const addrKey = normalizeAddress(t.address);
+          const nick = addrKey && nickMap ? nickMap[addrKey] : null;
+          const addrText = t.address || addrKey || '-';
+          const addrHtml = nick
+            ? (`<strong>${escapeHtml(nick)}</strong><div class="small muted">${addrText}</div>`)
+            : `<span class="addr">${addrText}</span>`;
           tr.innerHTML = `
-            <td class="small muted">${formatTime(t.time)}</td>
+            <td class="small muted trade-time" data-time="${t.time || ''}">${formatTime(t.time)}</td>
             <td>${addrHtml}</td>
             <td>${escapeHtml(t.action || '')}</td>
             <td>${Number(t.size).toFixed(5)}</td>
@@ -211,6 +345,8 @@
           `;
           tradesTbody.appendChild(tr);
         });
+        refreshRelativeTradeTimes();
+        updateTradeSentinelIdle();
       }
 
       function sortPositions(positions) {
@@ -270,10 +406,7 @@
           } else {
             showToast('Refresh action failed', { type: 'error' });
           }
-          const { trades, nextBeforeAt } = await fetchAllTrades(500);
-          tradesState.items = trades;
-          tradesState.nextBeforeAt = nextBeforeAt;
-          renderTrades(tradesState.items);
+          await loadInitialTrades(500);
         } catch (e) {
           console.error('full refresh failed', e);
           showToast('Failed to refresh fills', { type: 'error' });
@@ -295,8 +428,9 @@
           const j = await r.json().catch(()=>({}));
           if (!r.ok) throw new Error('clear failed');
           tradesState.items = [];
-          tradesState.nextBeforeAt = null;
+          tradesState.nextCursor = null;
           renderTrades([]);
+          updateTradeSentinelIdle();
           showToast(`Deleted ${j.deleted || 0} fills from DB`, { type: 'success' });
         } catch (e) {
           console.error('clear all fills failed', e);
@@ -314,8 +448,8 @@
 
       async function loadMoreFills() {
         if (tradesState.loadingMore) return;
-        if (!tradesState.nextBeforeAt) {
-          tradeSentinel.innerHTML = '<span class="small muted">No more fills</span>';
+        if (!tradesState.nextCursor) {
+          updateTradeSentinelIdle();
           if (tradesState.observer) tradesState.observer.disconnect();
           return;
         }
@@ -323,23 +457,23 @@
         if (!canLoadMore(tradesState.rate, 800)) return;
         tradesState.loadingMore = true;
         tradeSentinel.classList.add('loading');
+        tradeSentinel.innerHTML = '<span class="small muted">Loading more…</span>';
         showSkeletonRows();
         try {
-          const { trades, nextBeforeAt } = await fetchAllTrades(200, tradesState.nextBeforeAt);
+          const { trades, nextCursor } = await fetchAllTrades(200, tradesState.nextCursor, tradesState.addressFilter || null);
           if (trades.length === 0) {
-            tradesState.nextBeforeAt = null;
-            tradeSentinel.innerHTML = '<span class="small muted">Reached oldest fills</span>';
+            tradesState.nextCursor = null;
+            updateTradeSentinelIdle();
             if (tradesState.observer) tradesState.observer.disconnect();
             showToast('Reached oldest fills', { type: 'success', ttl: 2500 });
           } else {
-            // Dedup by id + time combo
-            const seen = new Set(tradesState.items.map(t => `${t.id}|${t.time}`));
-            const newOnes = trades.filter(t => !seen.has(`${t.id}|${t.time}`));
-            tradesState.items = tradesState.items.concat(newOnes);
-            tradesState.nextBeforeAt = nextBeforeAt;
+            const beforeCount = tradesState.items.length;
+            tradesState.items = mergeTrades(tradesState.items, trades);
+            const newCount = Math.max(0, tradesState.items.length - beforeCount);
+            tradesState.nextCursor = nextCursor;
             renderTrades(tradesState.items);
-            showToast(`Loaded ${newOnes.length} older fills`, { type: 'success' });
-            tradeSentinel.innerHTML = '<span class="small muted">Loading more…</span>';
+            showToast(`Loaded ${newCount} older fills`, { type: 'success' });
+            updateTradeSentinelIdle();
           }
         } catch (e) {
           console.error('load more failed', e);
@@ -437,6 +571,7 @@
           addMsg.textContent = 'Added';
           setTimeout(() => (addMsg.textContent = ''), 1200);
           await refresh();
+          await refreshNicknames();
         } catch (e) {
           addMsg.textContent = 'Network error';
         }
@@ -550,7 +685,10 @@
       refreshIpDisplay();
       setInterval(refreshIpDisplay, 60000);
       // Initial trades load (current stored trades)
-  fetchAllTrades(300).then(({ trades, nextBeforeAt }) => { tradesState.items = trades; tradesState.nextBeforeAt = nextBeforeAt; renderTrades(tradesState.items); initInfiniteScroll(); }).catch(()=>{});
+  (async () => {
+    await refreshNicknames();
+    await loadInitialTrades(300);
+  })();
   // Real-time WebSocket client
   let ws; let wsRetry = 0;
   function connectWS() {
@@ -565,8 +703,12 @@
           let tradeAdditions = [];
           for (const ev of evs) {
             if (ev.type === 'trade') {
+              const normAddr = normalizeAddress(ev.address);
+              if (tradesState.addressFilter && normAddr !== tradesState.addressFilter) {
+                continue;
+              }
               tradeAdditions.push({
-                id: ev.seq, // using seq as temporary id for real-time preview
+                id: ev.dbId ?? ev.seq,
                 time: ev.at,
                 address: ev.address,
                 action: ev.action || (ev.side === 'buy' ? 'Buy' : 'Sell'),
@@ -574,6 +716,7 @@
                 startPosition: ev.startPosition ?? null,
                 price: ev.priceUsd,
                 closedPnl: ev.realizedPnlUsd ?? null,
+                tx: ev.hash ?? null,
               });
             }
           }
@@ -605,6 +748,11 @@
   connectWS();
       if (timeModeSel) timeModeSel.value = timeMode;
       timeModeSel.addEventListener('change', () => { timeMode = timeModeSel.value; renderTrades(tradesState.items); });
+      if (tradesAddressFilter) {
+        tradesAddressFilter.addEventListener('change', async () => {
+          await applyAddressFilter(tradesAddressFilter.value || '');
+        });
+      }
 
       function formatUsd(n) {
         if (typeof n !== 'number' || !isFinite(n)) return '-';
@@ -613,6 +761,7 @@
         } catch { return '$' + n.toFixed(2); }
       }
       function formatTime(iso) {
+        if (!iso) return '-';
         const d = new Date(iso);
         if (timeMode === 'relative') {
           const diffMs = Date.now() - d.getTime();

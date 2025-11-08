@@ -88,8 +88,8 @@ async function backfillRecentForAddress(addr: string, limit = 100) {
       feeToken: (f as any).feeToken ?? null,
       hash: (f as any).hash ?? null,
     };
-    const ok = await insertTradeIfNew(addr, payload);
-    if (ok) inserted += 1;
+    const result = await insertTradeIfNew(addr, payload);
+    if (result.inserted) inserted += 1;
   }
   return inserted;
 }
@@ -170,13 +170,15 @@ app.get('/api/current-positions', async (_req, res) => {
 app.get('/api/latest-trades', async (req, res) => {
   const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 100)));
   const beforeAtRaw = typeof req.query.beforeAt === 'string' ? String(req.query.beforeAt) : null;
+  const beforeIdRaw = typeof req.query.beforeId === 'string' ? Number(req.query.beforeId) : null;
+  const beforeId = Number.isFinite(beforeIdRaw) ? Number(beforeIdRaw) : null;
   const address = typeof req.query.address === 'string' ? String(req.query.address).toLowerCase() : null;
   try {
     // Opportunistic light backfill when requesting first page for one address
-    if (address && !beforeAtRaw) {
+    if (address && !beforeAtRaw && beforeId == null) {
       try { await backfillRecentForAddress(address, 100); } catch {}
     }
-    const rows = await pageTradesByTime({ limit, beforeAt: beforeAtRaw, address });
+    const rows = await pageTradesByTime({ limit, beforeAt: beforeAtRaw, beforeId, address });
     const trades = rows.map((r) => {
       const p = r.payload || {};
       const closedPnl = p.realizedPnlUsd != null ? Number(p.realizedPnlUsd) : (p.closedPnl != null ? Number(p.closedPnl) : null);
@@ -195,8 +197,14 @@ app.get('/api/latest-trades', async (req, res) => {
         tx: p.hash || null,
       };
     });
-    const nextBeforeAt = trades.length > 0 ? trades[trades.length - 1].time : null;
-    return res.json({ trades, nextBeforeAt });
+    const last = rows.length > 0 ? rows[rows.length - 1] : null;
+    const nextCursor = last ? { beforeAt: last.at || null, beforeId: last.id } : null;
+    return res.json({
+      trades,
+      nextCursor,
+      nextBeforeAt: nextCursor?.beforeAt ?? null,
+      nextBeforeId: nextCursor?.beforeId ?? null,
+    });
   } catch (e) {
     return res.status(500).json({ error: 'failed to fetch trades' });
   }
@@ -232,8 +240,8 @@ app.post('/api/backfill', async (req, res) => {
           feeToken: f.feeToken ?? null,
           hash: f.hash ?? null,
         };
-        const ok = await insertTradeIfNew(addr, payload);
-        if (ok) inserted += 1;
+        const result = await insertTradeIfNew(addr, payload);
+        if (result.inserted) inserted += 1;
       }
     }
     res.json({ ok: true, inserted });
@@ -415,10 +423,10 @@ initStorage()
                 realizedPnlUsd: f.closedPnl ?? null,
                 fee: f.fee ?? null,
                 feeToken: f.feeToken ?? null,
-                hash: f.hash ?? null,
-              };
-              const ok = await insertTradeIfNew(addr, payload);
-              if (ok) inserted += 1;
+              hash: f.hash ?? null,
+            };
+              const result = await insertTradeIfNew(addr, payload);
+              if (result.inserted) inserted += 1;
             }
             if (inserted > 0) console.log(`[startup] Backfilled ${inserted} trade(s) for ${addr}`);
           }
@@ -453,6 +461,7 @@ initStorage()
 app.post('/api/clear-and-backfill-all', async (_req, res) => {
   try {
     const deleted = await deleteAllTrades();
+    changes.reset();
     const addrs = await getAddresses();
     const perAddress: Record<string, { inserted: number }> = {};
     for (const addr of addrs) {
@@ -469,6 +478,7 @@ app.post('/api/clear-and-backfill-all', async (_req, res) => {
 app.post('/api/clear-all-trades', async (_req, res) => {
   try {
     const deleted = await deleteAllTrades();
+    changes.reset();
     res.json({ ok: true, deleted });
   } catch (e) {
     res.status(500).json({ ok: false, error: 'clear-all-trades failed' });

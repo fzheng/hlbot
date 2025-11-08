@@ -128,6 +128,56 @@ header.site-header h1 {
 .tag.sell { color: #fff; background: #ff4d4f; }
 /* Forms */
 .row { display: flex; gap: var(--space-2); align-items: center; flex-wrap: wrap; }
+.trades-header { align-items: flex-end; gap: var(--space-3); }
+.trades-controls {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-end;
+  flex-wrap: wrap;
+  width: 100%;
+}
+.control-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 120px;
+}
+.control-field select {
+  width: 160px;
+}
+.control-field.grow {
+  flex: 1 1 240px;
+}
+.control-field.grow select {
+  width: 100%;
+}
+.control-actions {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+.control-actions button {
+  min-width: 110px;
+}
+@media (max-width: 680px) {
+  .trades-controls {
+    align-items: stretch;
+  }
+  .control-field,
+  .control-field select {
+    width: 100%;
+  }
+  .control-actions {
+    width: 100%;
+    justify-content: flex-start;
+    margin-left: 0;
+  }
+  .control-actions button {
+    flex: 1 1 auto;
+  }
+}
 input[type=text] {
   width: clamp(240px, 40vw, 420px);
   padding: 10px 12px;

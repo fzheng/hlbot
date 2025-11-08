@@ -29,6 +29,7 @@ export type ChangeEvent =
       feeToken?: string;
       hash?: string;
       action?: string;
+      dbId?: number;
     };
 
 export class EventQueue {
@@ -57,6 +58,11 @@ export class EventQueue {
 
   latestSeq(): number {
     return this.nextSeq - 1;
+  }
+
+  reset(): void {
+    this.buffer = [];
+    this.nextSeq = 1;
   }
 }
 

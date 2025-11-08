@@ -84,13 +84,23 @@ export async function latestTrades(limit = 50): Promise<any[]> {
 }
 
 // Time-based pagination (preferred for chronological ordering). Optional beforeAt ISO cursor.
-export async function pageTradesByTime(opts: { limit?: number; beforeAt?: string | null; address?: string | null }): Promise<{ id: number; address: string; at: string; payload: any }[]> {
+export async function pageTradesByTime(opts: { limit?: number; beforeAt?: string | null; beforeId?: number | null; address?: string | null }): Promise<{ id: number; address: string; at: string; payload: any }[]> {
   const limit = Math.max(1, Math.min(500, opts.limit ?? 100));
   try {
     const p = await getPool();
     const clauses: string[] = ["type = 'trade'"]; const params: any[] = []; let idx = 1;
     if (opts.address) { clauses.push(`address = $${idx++}`); params.push(String(opts.address).toLowerCase()); }
-    if (opts.beforeAt) { clauses.push(`at < $${idx++}`); params.push(opts.beforeAt); }
+    if (opts.beforeAt && opts.beforeId != null) {
+      clauses.push(`(at < $${idx} OR (at = $${idx} AND id < $${idx + 1}))`);
+      params.push(opts.beforeAt, opts.beforeId);
+      idx += 2;
+    } else if (opts.beforeAt) {
+      clauses.push(`at < $${idx++}`);
+      params.push(opts.beforeAt);
+    } else if (opts.beforeId != null) {
+      clauses.push(`id < $${idx++}`);
+      params.push(opts.beforeId);
+    }
     const where = clauses.length ? 'where ' + clauses.join(' and ') : '';
     const sql = `select id, address, at, payload from hl_events ${where} order by at desc, id desc limit ${limit}`;
     const { rows } = await p.query(sql, params);
@@ -110,7 +120,12 @@ export async function deleteAllTrades(): Promise<number> {
   }
 }
 
-export async function insertTradeIfNew(address: string, payload: any): Promise<boolean> {
+export interface InsertTradeResult {
+  id: number | null;
+  inserted: boolean;
+}
+
+export async function insertTradeIfNew(address: string, payload: any): Promise<InsertTradeResult> {
   try {
     const p = await getPool();
     const addr = address.toLowerCase();
@@ -122,17 +137,18 @@ export async function insertTradeIfNew(address: string, payload: any): Promise<b
       );
       if (rows.length > 0) {
         // Update existing payload to the newer (e.g., aggregated) one
-        await p.query('update hl_events set at = $1, payload = $2 where id = $3', [payload.at || new Date().toISOString(), payload, rows[0].id]);
-        return true;
+        const targetId = Number(rows[0].id);
+        await p.query('update hl_events set at = $1, payload = $2 where id = $3', [payload.at || new Date().toISOString(), payload, targetId]);
+        return { id: targetId, inserted: false };
       }
     }
-    await p.query(
-      'insert into hl_events (at, address, type, symbol, payload) values ($1,$2,$3,$4,$5)',
+    const { rows } = await p.query(
+      'insert into hl_events (at, address, type, symbol, payload) values ($1,$2,$3,$4,$5) returning id',
       [payload.at || new Date().toISOString(), addr, 'trade', payload.symbol || 'BTC', payload]
     );
-    return true;
+    return { id: rows?.[0]?.id ?? null, inserted: true };
   } catch (_e) {
-    return false;
+    return { id: null, inserted: false };
   }
 }
 

@@ -7,6 +7,7 @@ export interface TradeRow {
   startPosition: number | null;
   price: number;
   closedPnl: number | null;
+  tx?: string | null;
 }
 
 /**
@@ -14,11 +15,18 @@ export interface TradeRow {
  * Dedupe key: id|time. Assumes both inputs individually have no duplicates.
  * Returns a new array sorted descending by time then id.
  */
+function tradeKey(t: Partial<TradeRow>): string {
+  if (t?.tx) return `tx:${String(t.tx).toLowerCase()}`;
+  if ((t as any)?.hash) return `tx:${String((t as any).hash).toLowerCase()}`;
+  if (t?.id != null) return `id:${t.id}`;
+  return `time:${t?.time}|addr:${t?.address}|size:${t?.size}|price:${t?.price}`;
+}
+
 export function mergeTrades(existing: TradeRow[], incoming: TradeRow[]): TradeRow[] {
-  const seen = new Set(existing.map(t => `${t.id}|${t.time}`));
+  const seen = new Set(existing.map((t) => tradeKey(t)));
   const additions: TradeRow[] = [];
   for (const t of incoming) {
-    const key = `${t.id}|${t.time}`;
+    const key = tradeKey(t);
     if (!seen.has(key)) {
       seen.add(key);
       additions.push(t);
