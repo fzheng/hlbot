@@ -27,12 +27,16 @@ export class RealtimeTracker {
   private snapshots: Map<Address, { data: PositionSnapshot; updatedAt: string }>;
   private getAddresses: () => Promise<Address[]>;
   private q: EventQueue;
+  private primeInflight: Map<Address, Promise<void>>;
+  private lastPrimeAt: Map<Address, number>;
 
   constructor(getAddresses: () => Promise<Address[]>, queue: EventQueue) {
     this.getAddresses = getAddresses;
     this.q = queue;
     this.subs = new Map();
     this.snapshots = new Map();
+    this.primeInflight = new Map();
+    this.lastPrimeAt = new Map();
   }
 
   async start() {
@@ -106,6 +110,9 @@ export class RealtimeTracker {
     }
 
     this.subs.set(addr, subs);
+    if (!this.snapshots.has(addr)) {
+      void this.primeFromHttp(addr);
+    }
   }
 
   private onClearinghouse(addr: Address, evt: any) {
@@ -177,6 +184,7 @@ export class RealtimeTracker {
       // We care about FillEvent variant: { fills: [...] }
       if (!evt || !('fills' in evt)) return;
       const fills: any[] = Array.isArray(evt.fills) ? evt.fills : [];
+      let touched = false;
       for (const f of fills) {
         const coin = f?.coin ?? '';
         if (!/^btc$/i.test(String(coin))) continue;
@@ -240,6 +248,10 @@ export class RealtimeTracker {
           action: actionLabel,
           dbId: persistResult.id ?? undefined,
         });
+        touched = true;
+      }
+      if (touched) {
+        void this.primeFromHttp(addr, { force: false, minIntervalMs: 2000 });
       }
     } catch (e) {
       // eslint-disable-next-line no-console
@@ -292,8 +304,27 @@ export class RealtimeTracker {
   }
 
   // Immediate prime via HTTP info API for newly added addresses
-  async primeFromHttp(addr: Address) {
+  async primeFromHttp(addr: Address, opts?: { force?: boolean; minIntervalMs?: number }): Promise<void> {
+    const { force = true, minIntervalMs = 0 } = opts || {};
+    const inflight = this.primeInflight.get(addr);
+    if (inflight) return inflight;
+    if (!force && minIntervalMs > 0) {
+      const last = this.lastPrimeAt.get(addr) ?? 0;
+      if (Date.now() - last < minIntervalMs) return Promise.resolve();
+    }
+    const task = this.performPrime(addr).finally(() => {
+      this.lastPrimeAt.set(addr, Date.now());
+      this.primeInflight.delete(addr);
+    });
+    this.primeInflight.set(addr, task);
+    return task;
+  }
+
+  private async performPrime(addr: Address): Promise<void> {
     try {
+      if (!this.http) {
+        this.http = new (hl as any).HttpTransport();
+      }
       const user = addr as `0x${string}`;
       const data = await infoClearinghouse(
         { transport: this.http },
@@ -346,6 +377,24 @@ export class RealtimeTracker {
       });
     } catch (_e) {
       // ignore
+    }
+  }
+
+  async ensureFreshSnapshots(maxAgeMs = 60000): Promise<void> {
+    try {
+      const addrs = (await this.getAddresses()).map((a) => a.toLowerCase());
+      const now = Date.now();
+      const tasks: Promise<void>[] = [];
+      for (const addr of addrs) {
+        const snap = this.snapshots.get(addr);
+        const updatedMs = snap?.updatedAt ? Date.parse(snap.updatedAt) : NaN;
+        if (!snap || !Number.isFinite(updatedMs) || now - updatedMs > maxAgeMs) {
+          tasks.push(this.primeFromHttp(addr, { force: true }));
+        }
+      }
+      if (tasks.length) await Promise.allSettled(tasks);
+    } catch {
+      // best-effort safeguard; ignore failures
     }
   }
 }

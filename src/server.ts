@@ -13,6 +13,11 @@ import { WebSocketServer } from 'ws';
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const IPINFO_INTERVAL_MS = process.env.IPINFO_INTERVAL_MS ? Number(process.env.IPINFO_INTERVAL_MS) : 600_000; // 10 minutes
+const CURRENT_POSITION_MAX_AGE_MS = (() => {
+  const raw = Number(process.env.CURRENT_POSITION_MAX_AGE_MS);
+  if (Number.isFinite(raw) && raw > 0) return Math.max(5000, raw);
+  return 60_000;
+})();
 
 app.use(cors());
 app.use(express.json());
@@ -156,6 +161,7 @@ app.get('/api/changes', (req, res) => {
 // Current BTC positions across tracked addresses (from realtime snapshots)
 app.get('/api/current-positions', async (_req, res) => {
   try {
+    await realtime.ensureFreshSnapshots(CURRENT_POSITION_MAX_AGE_MS);
     const base = realtime.getAllSnapshots();
     const nmap = await storageGetNicknames().catch(() => ({} as Record<string, string>));
     const enriched = base.map((p) => ({ ...p, nickname: (nmap as any)[p.address] || null }));
