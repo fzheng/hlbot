@@ -16,11 +16,4 @@ export interface PriceInfo {
   price: number;  // in USD
 }
 
-export interface Recommendation {
-  address: Address;
-  exposureBtc: number; // net BTC perp exposure
-  priceUsd: number;
-  score: number; // -1..+1
-  text: string;
-  timestamp: string; // ISO
-}
+// Recommendation interface removed (feature deprecated)

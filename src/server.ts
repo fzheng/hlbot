@@ -2,24 +2,27 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { initStorage, listAddresses as storageList, addAddress as storageAdd, removeAddress as storageRemove, getNicknames as storageGetNicknames, setNickname as storageSetNickname } from './storage';
-import { latestTrades, pageTrades, insertTradeIfNew, countValidTradesForAddress, deleteTradesForAddress } from './persist';
-import type { Address, Recommendation } from './types';
-import { Poller } from './poller';
+import { pageTradesByTime, insertTradeIfNew, countValidTradesForAddress, deleteTradesForAddress, deleteAllTrades } from './persist';
+import type { Address } from './types';
 import { fetchPerpPositions, fetchUserBtcFills } from './hyperliquid';
 import { startPriceFeed, refreshPriceFeed, getCurrentBtcPrice } from './price';
 import { EventQueue } from './queue';
 import { RealtimeTracker } from './realtime';
+import { WebSocketServer } from 'ws';
 
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
-const POLL_INTERVAL_MS = process.env.POLL_INTERVAL_MS ? Number(process.env.POLL_INTERVAL_MS) : 90_000;
 const IPINFO_INTERVAL_MS = process.env.IPINFO_INTERVAL_MS ? Number(process.env.IPINFO_INTERVAL_MS) : 600_000; // 10 minutes
+const CURRENT_POSITION_MAX_AGE_MS = (() => {
+  const raw = Number(process.env.CURRENT_POSITION_MAX_AGE_MS);
+  if (Number.isFinite(raw) && raw > 0) return Math.max(5000, raw);
+  return 60_000;
+})();
 
 app.use(cors());
 app.use(express.json());
 
-// In-memory state mirrors persisted addresses and latest recommendations
-let recommendations: Recommendation[] = [];
+// In-memory event queue for streaming incremental changes
 const changes = new EventQueue(5000);
 
 // Server-side IP/region tracking via ipinfo.io (VPN awareness)
@@ -61,12 +64,6 @@ async function refreshIpInfo(): Promise<IpInfo> {
 async function getAddresses(): Promise<Address[]> {
   return await storageList();
 }
-function setRecommendations(recs: Recommendation[]) {
-  recommendations = recs;
-}
-function getRecommendations(): Recommendation[] {
-  return recommendations;
-}
 
 // Helpers (local)
 function deriveActionLabel(startPosition: number, sz: number, side: 'B' | 'A'): string {
@@ -95,8 +92,8 @@ async function backfillRecentForAddress(addr: string, limit = 100) {
       feeToken: (f as any).feeToken ?? null,
       hash: (f as any).hash ?? null,
     };
-    const ok = await insertTradeIfNew(addr, payload);
-    if (ok) inserted += 1;
+    const result = await insertTradeIfNew(addr, payload);
+    if (result.inserted) inserted += 1;
   }
   return inserted;
 }
@@ -118,7 +115,6 @@ app.post('/api/addresses', async (req, res) => {
   if (!existing.includes(addr)) {
     await storageAdd(addr);
     console.log(`[api] Added address ${addr}`);
-    poller.trigger().catch((e) => console.warn('[api] immediate poll failed', e));
     refreshPriceFeed().catch((e) => console.warn('[api] price feed refresh failed', e));
     realtime.refresh().catch((e) => console.warn('[api] realtime refresh failed', e));
     // Immediately prime snapshot via HTTP so UI shows latest without waiting for WS
@@ -134,9 +130,7 @@ app.post('/api/addresses', async (req, res) => {
   res.json({ addresses: await getAddresses() });
 });
 
-app.get('/api/recommendations', (_req, res) => {
-  res.json({ recommendations: getRecommendations() });
-});
+// Recommendations endpoint removed (feature deprecated)
 
 app.get('/api/price', (_req, res) => {
   res.json(getCurrentBtcPrice());
@@ -167,6 +161,7 @@ app.get('/api/changes', (req, res) => {
 // Current BTC positions across tracked addresses (from realtime snapshots)
 app.get('/api/current-positions', async (_req, res) => {
   try {
+    await realtime.ensureFreshSnapshots(CURRENT_POSITION_MAX_AGE_MS);
     const base = realtime.getAllSnapshots();
     const nmap = await storageGetNicknames().catch(() => ({} as Record<string, string>));
     const enriched = base.map((p) => ({ ...p, nickname: (nmap as any)[p.address] || null }));
@@ -176,38 +171,45 @@ app.get('/api/current-positions', async (_req, res) => {
   }
 });
 
-// Latest trade fills (BTC only) across addresses
+// Latest trade fills (BTC only) across addresses, ordered strictly by timestamp desc then id desc
 app.get('/api/latest-trades', async (req, res) => {
   const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 100)));
-  const beforeIdRaw = req.query.beforeId;
-  const beforeId = beforeIdRaw != null ? Number(beforeIdRaw) : null;
+  const beforeAtRaw = typeof req.query.beforeAt === 'string' ? String(req.query.beforeAt) : null;
+  const beforeIdRaw = typeof req.query.beforeId === 'string' ? Number(req.query.beforeId) : null;
+  const beforeId = Number.isFinite(beforeIdRaw) ? Number(beforeIdRaw) : null;
   const address = typeof req.query.address === 'string' ? String(req.query.address).toLowerCase() : null;
   try {
-    // If requesting trades for a specific address, proactively refresh from Info API
-    if (address && !beforeId) {
+    // Opportunistic light backfill when requesting first page for one address
+    if (address && !beforeAtRaw && beforeId == null) {
       try { await backfillRecentForAddress(address, 100); } catch {}
     }
-    const rows = await pageTrades({ limit, beforeId, address });
+    const rows = await pageTradesByTime({ limit, beforeAt: beforeAtRaw, beforeId, address });
     const trades = rows.map((r) => {
       const p = r.payload || {};
       const closedPnl = p.realizedPnlUsd != null ? Number(p.realizedPnlUsd) : (p.closedPnl != null ? Number(p.closedPnl) : null);
       return {
         id: r.id,
-        time: p.at || null,
-        address: p.address || address || null,
+        time: r.at || p.at || null,
+        address: r.address || p.address || null,
         symbol: p.symbol || 'BTC',
         action: p.action || (p.side === 'buy' ? 'Buy' : 'Sell'),
-        size: Number(p.size || 0),
+        size: p.size != null ? Number(p.size) : (p.sz != null ? Math.abs(Number(p.sz)) : 0),
         startPosition: p.startPosition != null ? Number(p.startPosition) : null,
-        price: Number(p.priceUsd || p.px || 0),
+        price: p.priceUsd != null ? Number(p.priceUsd) : (p.px != null ? Number(p.px) : 0),
         closedPnl,
         fee: p.fee != null ? Number(p.fee) : null,
         feeToken: p.feeToken || null,
         tx: p.hash || null,
       };
     });
-    const nextBeforeId = trades.length > 0 ? Math.min(...rows.map(r => r.id)) : null;
-    return res.json({ trades, nextBeforeId });
+    const last = rows.length > 0 ? rows[rows.length - 1] : null;
+    const nextCursor = last ? { beforeAt: last.at || null, beforeId: last.id } : null;
+    return res.json({
+      trades,
+      nextCursor,
+      nextBeforeAt: nextCursor?.beforeAt ?? null,
+      nextBeforeId: nextCursor?.beforeId ?? null,
+    });
   } catch (e) {
     return res.status(500).json({ error: 'failed to fetch trades' });
   }
@@ -243,8 +245,8 @@ app.post('/api/backfill', async (req, res) => {
           feeToken: f.feeToken ?? null,
           hash: f.hash ?? null,
         };
-        const ok = await insertTradeIfNew(addr, payload);
-        if (ok) inserted += 1;
+        const result = await insertTradeIfNew(addr, payload);
+        if (result.inserted) inserted += 1;
       }
     }
     res.json({ ok: true, inserted });
@@ -280,7 +282,6 @@ app.delete('/api/addresses/:address', async (req, res) => {
   if (!addrParam) return res.status(400).json({ error: 'Invalid address' });
   await storageRemove(addrParam);
   console.log(`[api] Removed address ${addrParam}`);
-  recommendations = recommendations.filter((r) => r.address.toLowerCase() !== addrParam);
   await refreshPriceFeed().catch((e) => console.warn('[api] price feed refresh failed', e));
   await realtime.refresh().catch((e) => console.warn('[api] realtime refresh failed', e));
   res.json({ addresses: await getAddresses() });
@@ -301,15 +302,7 @@ app.post('/api/addresses/:address/nickname', async (req, res) => {
   }
 });
 
-// Trigger poll now
-app.post('/api/poll-now', async (_req, res) => {
-  try {
-    await poller.trigger();
-    res.json({ ok: true, at: new Date().toISOString() });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
+// Poller endpoint removed
 
 // On-demand perp positions for an address
 app.get('/api/positions/:address', async (req, res) => {
@@ -330,12 +323,6 @@ app.get('/', (_req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
-// Poller
-const poller = new Poller(getAddresses, setRecommendations, getRecommendations, {
-  intervalMs: POLL_INTERVAL_MS
-});
-poller.start();
-
 // Realtime subscriptions for BTC positions and trades
 const realtime = new RealtimeTracker(getAddresses, changes);
 realtime.start().catch((e) => console.warn('[realtime] start failed', e));
@@ -346,11 +333,73 @@ initStorage()
     // Initial IP info fetch and periodic refresh
     await refreshIpInfo().catch(() => {});
     setInterval(() => { void refreshIpInfo(); }, IPINFO_INTERVAL_MS);
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
       console.log(`hlbot server listening on http://localhost:${PORT}`);
     });
 
-    // Optional startup cleanup + backfill (latest 100) when enabled
+  // WebSocket: push real-time trade/position events
+  const wss = new WebSocketServer({ server, path: '/ws' });
+  interface WSClient { ws: any; lastSeq: number; alive: boolean; }
+  const clients = new Set<WSClient>();
+
+    wss.on('connection', (ws) => {
+      const c: WSClient = { ws, lastSeq: 0, alive: true };
+      clients.add(c);
+      ws.send(JSON.stringify({ type: 'hello', latestSeq: changes.latestSeq() }));
+      ws.on('message', (raw: any) => {
+        try {
+          const msg = JSON.parse(String(raw));
+          if (msg && typeof msg.since === 'number') {
+            c.lastSeq = msg.since;
+            const events = changes.listSince(msg.since, 500);
+            if (events.length) {
+              c.lastSeq = events[events.length - 1].seq;
+              ws.send(JSON.stringify({ type: 'batch', events }));
+            }
+          }
+        } catch { /* ignore */ }
+      });
+      ws.on('pong', () => { c.alive = true; });
+      ws.on('close', () => { clients.delete(c); });
+    });
+
+    // Adaptive broadcast + heartbeat
+    let broadcastInterval = 1000; // default
+    function scheduleBroadcast() {
+      const count = clients.size;
+      // Faster when many clients
+      broadcastInterval = count > 25 ? 250 : count > 10 ? 500 : 1000;
+      setTimeout(runBroadcast, broadcastInterval);
+    }
+    function runBroadcast() {
+      if (clients.size) {
+        for (const c of clients) {
+          if (c.ws.readyState !== 1) continue; // OPEN
+          const events = changes.listSince(c.lastSeq, 200);
+          if (events.length) {
+            c.lastSeq = events[events.length - 1].seq;
+            c.ws.send(JSON.stringify({ type: 'events', events }));
+          }
+        }
+      }
+      scheduleBroadcast();
+    }
+    scheduleBroadcast();
+
+    // Heartbeat: ping every 30s, drop unresponsive
+    setInterval(() => {
+      for (const c of clients) {
+        if (!c.alive) {
+          try { c.ws.terminate(); } catch {}
+          clients.delete(c);
+          continue;
+        }
+        c.alive = false;
+        try { c.ws.ping(); } catch {}
+      }
+    }, 30000);
+
+  // Optional startup cleanup + backfill (latest 100) when enabled
     if (String(process.env.BACKFILL_ON_START || '').toLowerCase() === 'true') {
       (async () => {
         try {
@@ -379,10 +428,10 @@ initStorage()
                 realizedPnlUsd: f.closedPnl ?? null,
                 fee: f.fee ?? null,
                 feeToken: f.feeToken ?? null,
-                hash: f.hash ?? null,
-              };
-              const ok = await insertTradeIfNew(addr, payload);
-              if (ok) inserted += 1;
+              hash: f.hash ?? null,
+            };
+              const result = await insertTradeIfNew(addr, payload);
+              if (result.inserted) inserted += 1;
             }
             if (inserted > 0) console.log(`[startup] Backfilled ${inserted} trade(s) for ${addr}`);
           }
@@ -413,20 +462,30 @@ initStorage()
     console.error('[server] failed to init storage', e);
     process.exit(1);
   });
-// Cleanup invalid trades and backfill up to 100 for each address without valid trades
-app.post('/api/cleanup-and-backfill', async (_req, res) => {
+// Clear ALL trades then backfill latest fills for every address (drives single Refresh All button in UI)
+app.post('/api/clear-and-backfill-all', async (_req, res) => {
   try {
+    const deleted = await deleteAllTrades();
+    changes.reset();
     const addrs = await getAddresses();
-    const results: Record<string, { deleted: number; inserted: number }> = {};
+    const perAddress: Record<string, { inserted: number }> = {};
     for (const addr of addrs) {
-      const valid = await countValidTradesForAddress(addr);
-      if (valid > 0) { results[addr] = { deleted: 0, inserted: 0 }; continue; }
-      const deleted = await deleteTradesForAddress(addr);
-      const inserted = await backfillRecentForAddress(addr, 100);
-      results[addr] = { deleted, inserted };
+      const inserted = await backfillRecentForAddress(addr, 300);
+      perAddress[addr] = { inserted };
     }
-    res.json({ ok: true, results });
+    res.json({ ok: true, deleted, perAddress });
   } catch (e) {
-    res.status(500).json({ ok: false, error: 'cleanup failed' });
+    res.status(500).json({ ok: false, error: 'clear-and-backfill failed' });
+  }
+});
+
+// Clear ALL trades only (no backfill) for manual purge via UI button
+app.post('/api/clear-all-trades', async (_req, res) => {
+  try {
+    const deleted = await deleteAllTrades();
+    changes.reset();
+    res.json({ ok: true, deleted });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'clear-all-trades failed' });
   }
 });

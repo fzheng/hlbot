@@ -24,6 +24,12 @@ export type ChangeEvent =
       priceUsd: number;
       size: number; // absolute
       realizedPnlUsd?: number;
+      startPosition?: number;
+      fee?: number;
+      feeToken?: string;
+      hash?: string;
+      action?: string;
+      dbId?: number;
     };
 
 export class EventQueue {
@@ -52,6 +58,11 @@ export class EventQueue {
 
   latestSeq(): number {
     return this.nextSeq - 1;
+  }
+
+  reset(): void {
+    this.buffer = [];
+    this.nextSeq = 1;
   }
 }
 

@@ -2,113 +2,224 @@
 
 ![Coverage](badges/coverage.svg) [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-brightgreen.svg?style=flat-square)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
 
-Single-tenant Hyperliquid BTC Perp Tracker (MVP).
+Single‑tenant Hyperliquid BTC perp tracker with real‑time fills & positions, time‑based pagination, and a minimal responsive UI.
 
-Quick start
-- Prereqs: Node.js 18+ (global `fetch`), npm or pnpm.
-- Install deps: `npm install`
-- Dev run (memory storage): `npm run dev` then open http://localhost:3000
+> NOTE: The legacy recommendation & poller system has been removed. Trade pagination now uses a timestamp+id cursor (`beforeAt` + `beforeId`) for strict chronological ordering.
 
-Local development (with Postgres)
-- Start Postgres only via Compose: `docker compose up -d db`
-- Set env for the app (PowerShell examples):
-  - `$env:STORAGE_BACKEND = 'postgres'`
-  - `$env:DATABASE_URL = 'postgresql://hlbot:hlbotpassword@localhost:5432/hlbot'`
-- Apply migrations: `npm run migrate`
-- Start dev server: `npm run dev` (http://localhost:3000)
+## Quick Start
 
-Production (bare metal)
-- Build: `npm run build`
-- Set env (at minimum): `STORAGE_BACKEND=postgres`, `DATABASE_URL=postgresql://...`
-- Migrate: `npm run migrate`
-- Start: `npm start`
+1. Prereqs: Node.js 18+, npm (or pnpm).
+2. Install: `npm install`
+3. Dev (in‑memory storage): `npm run dev` → http://localhost:3000
 
-Docker
-- Create `.env` from template: `cp .env.example .env` (or copy manually on Windows)
-- Build and run all services: `docker compose up -d --build`
-- Open the UI: http://localhost:3000 (or set `APP_PORT` in `.env`)
-- View logs: `docker compose logs -f app`
-- Stop containers (keep data): `docker compose down`
-- Remove containers and data: `docker compose down -v`
-- Notes:
-  - Default backend is Postgres (`STORAGE_BACKEND=postgres`) with persistent volume `pgdata`.
-  - Redis is included but optional. Switch by setting `STORAGE_BACKEND=redis` and ensuring `REDIS_URL` is set.
-  - The app runs DB migrations automatically on container start.
+### With Postgres (recommended)
+```bash
+docker compose up -d db
+export STORAGE_BACKEND=postgres
+export DATABASE_URL=postgresql://hlbot:hlbotpassword@localhost:5432/hlbot
+npm run migrate
+npm run dev
+```
 
-Migrations
-- All SQL migrations live in `migrations/` and are applied in lexicographic order (e.g., `001_init.sql`, `002_add_x.sql`).
-- Applied versions are tracked in `schema_migrations`.
-- Run locally: `npm run migrate` or check status with `npm run migrate:status`.
-- In Docker: the app image runs migrations automatically on startup via `docker/entrypoint.sh` before launching the server.
+### Production (bare metal)
+```bash
+npm run build
+STORAGE_BACKEND=postgres DATABASE_URL=postgresql://... npm run migrate
+PORT=3000 node dist/server.js
+```
 
-Environment variables
-- `PORT` (default `3000`) — Express server port.
-- `POLL_INTERVAL_MS` (default `90000`) — background poll interval.
-- `STORAGE_BACKEND` — `postgres` (recommended), `redis`, or `memory`.
-- Postgres: use `DATABASE_URL` (e.g., `postgresql://user:pass@host:5432/db`).
-- Redis: use `REDIS_URL` (e.g., `redis://localhost:6379`).
-- See `.env.example` for a complete template used by docker-compose.
+### Docker
+```bash
+cp .env.example .env   # adjust values
+docker compose up -d --build
+open http://localhost:3000
+```
+Common admin:
+```bash
+docker compose logs -f app
+docker compose down            # stop keep volumes
+docker compose down -v         # stop + wipe data
+docker compose build --no-cache && docker compose up -d --force-recreate  # force rebuild
+```
 
-API endpoints
-- `GET /api/addresses` — list tracked addresses.
-- `POST /api/addresses` — add an address `{ address: string }`.
-- `DELETE /api/addresses/:address` — remove an address.
-- `GET /api/recommendations` — current recommendations.
-- `POST /api/poll-now` — trigger an immediate background poll.
-- `GET /api/positions/:address` — on-demand perp positions for an address.
-- `GET /api/price` — current BTCUSD price (ws/http source info included).
-- `GET /` — static UI.
+## Features
 
-Realtime changes (beta)
-- The server streams BTC position changes and trade fills into an in-memory queue.
-- Pull API: `GET /api/changes?since=<seq>&limit=<n>` returns ordered events and the next cursor.
-- Event types:
-  - `position`: `{ address, symbol: 'BTC', size (signed), side, entryPriceUsd, liquidationPriceUsd, leverage, pnlUsd, at, seq }`
-  - `trade`: `{ address, symbol: 'BTC', side: 'buy'|'sell', direction: 'long'|'short', effect: 'open'|'close', priceUsd, size, realizedPnlUsd?, at, seq }`
-- Notes: events are kept in memory (rolling buffer). Persisting or server-sent streaming can be added next.
+- Track multiple addresses (nickname support) and view consolidated BTC perp fills & positions.
+- Real‑time WebSocket stream (`/ws`) for incremental trade & position events (adaptive broadcast + heartbeat).
+- Time‑based trade pagination (cursor `beforeAt`) with infinite scroll & skeleton loaders.
+- Fast in‑memory event queue + durable Postgres storage (`hl_events`, `hl_current_positions`).
+- One‑click Refresh All (clear DB + backfill) & Clear (purge only) actions.
+- Accessible UI: relative/absolute time toggle, toast notifications, focus styles.
+- Deduplication by (time,id) client side; hash stored for future refinement.
+- DB indexes for chronological queries (global + per address).
 
-Troubleshooting
-- Port in use (3000/5432): change `APP_PORT`, `PG_PORT`, or `PORT` in `.env`.
-- DB not ready: compose waits for Postgres health. Check `docker compose logs db`.
-- Migrations failed: view `docker compose logs app` or run `npm run migrate` locally with correct `DATABASE_URL`.
-- Reset data: `docker compose down -v` (removes Postgres and Redis volumes).
+## Data & Storage
 
-Features
-- Add an address to track; de-duplicated and persisted via Redis or Postgres.
-- Background poller (default 90s) fetches BTC price and best-effort BTC perp exposure.
-- Recommendations computed server-side and polled by the UI every 10s.
-- Minimal single-page UI served from `/`.
+| Table | Purpose |
+|-------|---------|
+| `hl_events` | Append‑only events (type = 'trade' or 'position' JSON payload) |
+| `hl_current_positions` | Latest snapshot per address (upserted) |
+| `schema_migrations` | Applied migration versions |
 
-Config
-- `PORT` env var to change port (default 3000).
-- `POLL_INTERVAL_MS` to change poll frequency (default 90000).
-- Storage backend (no local files):
-  - Redis: set `STORAGE_BACKEND=redis` and `REDIS_URL=redis://localhost:6379`
-  - Postgres: set `STORAGE_BACKEND=postgres` and either `PG_CONNECTION_STRING` or `DATABASE_URL`
-  - If neither is set, an in-memory backend is used (dev/tests only).
+### Migrations
+SQL lives in `scripts/migrations/` and is applied lexicographically. Run:
+```bash
+npm run migrate
+npm run migrate:status
+```
+The Docker entrypoint also runs migrations automatically on container start.
 
-Notes
-- If Hyperliquid API parsing fails, exposure falls back to 0 (neutral rec). This keeps the server robust.
+## Environment Variables
 
-Realtime and trades
-- Live WS subscriptions track BTC positions and user fills per address.
-- Durable store in Postgres for trades (`hl_events`) and current positions (`hl_current_positions`).
-- Cursor pagination for trades: `GET /api/latest-trades?limit=100&beforeId=<id>&address=<0x...>` → `{ trades, nextBeforeId }`.
-- Backfill and cleanup:
-  - `POST /api/backfill` with `{ address?: string|null, limit?: number }` imports recent fills for an address or for all when `address` is null.
-  - `POST /api/cleanup-and-backfill` purges invalid trades and backfills up to 100 per tracked address.
-  - New addresses are auto‑backfilled (latest 100).
-  - Unique index on trade tx hash prevents duplicates during backfill.
+| Var | Default | Description |
+|-----|---------|-------------|
+| `PORT` | 3000 | HTTP server port |
+| `STORAGE_BACKEND` | memory | `postgres` | `redis` | `memory` |
+| `DATABASE_URL` / `PG_CONNECTION_STRING` | – | Postgres connection string |
+| `REDIS_URL` | – | Redis connection (optional) |
+| `BACKFILL_ON_START` | false | If `true`, clears & seeds initial recent fills on boot |
+| `IPINFO_INTERVAL_MS` | 600000 | Interval for IP/region refresh (for display only) |
 
-Additional endpoints (summary)
-- `GET /api/current-positions` — current BTC positions for all tracked addresses (with nicknames when set).
-- `GET /api/latest-trades` — stable, paginated latest trades from DB.
-- `GET /api/user-trades/:address` — recent BTC fills for a specific address (Info API).
-- `POST /api/backfill` — backfill recent fills to DB (deduped by tx hash).
-- `POST /api/cleanup-and-backfill` — cleanup invalid trades and seed latest fills for all addresses.
-- `POST /api/addresses/:address/nickname` — set/clear nickname.
+Removed variables: `POLL_INTERVAL_MS` (poller deprecated).
 
-UI highlights
-- Positions: nickname editing, integrated address actions, and updated time column with Absolute/Relative toggle.
-- Trades: Address filter, Refresh, Load more (pagination), Backfill, Clean + Backfill actions.
-- Sorting: click table headers (positions and trades).
+## HTTP API
+
+Addresses / Nicknames:
+- `GET /api/addresses`
+- `POST /api/addresses` `{ address }`
+- `DELETE /api/addresses/:address`
+- `POST /api/addresses/:address/nickname` `{ nickname } | { nickname: "" }` (clear)
+
+Positions & Price:
+- `GET /api/current-positions` – consolidated latest positions
+- `GET /api/positions/:address` – on‑demand position snapshot
+- `GET /api/price` – current BTC price snapshot
+
+Trades:
+- `GET /api/latest-trades?limit=200&beforeAt=<ISO>&beforeId=<int>&address=<0x...>` → `{ trades, nextCursor }`
+- `GET /api/user-trades/:address` – recent fills direct from Info API (not paginated)
+- `POST /api/backfill` `{ address?: string|null, limit?: number }` – light recent fills ingestion
+- `POST /api/clear-all-trades` – destructive wipe of all stored trades
+- `POST /api/clear-and-backfill-all` – wipe then backfill recent fills for each tracked address
+
+Realtime (HTTP Pull):
+- `GET /api/changes?since=<seq>&limit=<n>` – incremental events (used mainly for fallback/debug)
+
+Static UI:
+- `GET /` – main interface (module script + realtime)
+
+Deprecated/Removed: `/api/recommendations`, `/api/poll-now`, `/api/cleanup-and-backfill`.
+
+## WebSocket API (`/ws`)
+
+Client connects → server sends:
+```json
+{ "type": "hello", "latestSeq": 1234 }
+```
+Client may request backlog:
+```json
+{ "since": 1200 }
+```
+Server pushes either incremental batches:
+```json
+{ "type": "events", "events": [ ... ] }
+```
+or initial catch-up:
+```json
+{ "type": "batch", "events": [ ... ] }
+```
+Event shapes:
+```
+position: {
+  type: 'position', seq, at, address, symbol: 'BTC',
+  size, side, entryPriceUsd, liquidationPriceUsd, leverage, pnlUsd
+}
+trade: {
+  type: 'trade', seq, at, address, symbol: 'BTC', side: 'buy'|'sell',
+  direction: 'long'|'short'|'flat', effect: 'open'|'close', priceUsd,
+  size, realizedPnlUsd?, startPosition?, fee?, feeToken?, hash?, action?
+}
+```
+Heartbeat: server pings every 30s; unresponsive clients are terminated.
+Adaptive broadcast interval: 1000ms (≤10 clients), 500ms (≤25), 250ms (>25).
+
+## Pagination Strategy
+Trades are ordered by `at desc, id desc`. Cursor = `{ beforeAt, beforeId }` from the last trade in a page. Supplying both ensures that fills sharing the exact same millisecond timestamp remain reachable while still preventing misordering that pure id-based pagination can introduce.
+
+## Refresh & Clear Workflow
+UI buttons:
+- **Refresh All** → POST `/api/clear-and-backfill-all` then reload first page (fresh consistent base).
+- **Clear** → POST `/api/clear-all-trades` (DB wipe only). Real‑time WS will then show only new incoming fills.
+Infinite scroll fetches older pages (200/page) as sentinel enters viewport; rate limited client side.
+
+## Development Tips
+Run tests:
+```bash
+npm test
+```
+Type checking / build:
+```bash
+npm run build
+```
+
+## FAQ
+
+### I don't see new UI changes (e.g., Refresh All / Clear buttons)
+1. Confirm you are on the correct branch: `git branch --show-current`.
+2. Commit/merge local changes if they are still unstaged.
+3. Force a Docker rebuild:
+   ```bash
+   docker compose build --no-cache
+   docker compose up -d --force-recreate
+   ```
+4. Hard refresh browser: open DevTools → Network tab → check “Disable cache” → Shift+Reload.
+5. Ensure no service worker is intercepting (DevTools > Application).
+
+### WebSocket not updating
+- Check Network → WS frames; ensure connection to `/ws` upgrades.
+- Confirm server logs show WebSocket connections.
+- Firewall / corporate proxy can block WS; test with `wscat` or `curl -v` to see 101 upgrade.
+
+### Pagination stopped loading
+- If sentinel shows *"No more fills"* you reached oldest stored record.
+- If it shows an error: network transient – scroll again (rate limiter 800ms).
+
+### How do I completely reset trade data?
+Use **Clear** (UI) or:
+```bash
+curl -X POST http://localhost:3000/api/clear-all-trades
+```
+Then optionally run Refresh All for a fresh backfill.
+
+### DB migration errors
+- Verify `DATABASE_URL` matches running Postgres.
+- Run migrations manually: `npm run migrate` and inspect output.
+- If a partial migration applied, fix the SQL then re-run; idempotent `CREATE INDEX IF NOT EXISTS` patterns are used.
+
+### How is dedup handled?
+Server: inserts skip when an existing trade with same `hash` for address exists. Client: merges by composite key `id|time` for stable sort.
+
+### Can I extend events with new fields?
+Yes – append to the trade payload & update the `ChangeEvent` union (see `src/queue.ts`). Frontend consumes unknown fields gracefully (ignored unless rendered).
+
+### Why time + id ordering?
+Ensures deterministic chronology even when two trades share identical millisecond timestamps; `id` breaks ties for stable, repeatable pagination.
+
+### Hard / Force Refresh Summary
+| Operation | Action |
+|-----------|--------|
+| Browser hard reload | Shift + Reload (or Cmd+Shift+R) |
+| Disable cache (dev) | DevTools > Network > Disable cache |
+| Force rebuild images | `docker compose build --no-cache` |
+| Force recreate containers | `docker compose up -d --force-recreate` |
+| Purge trade data | POST `/api/clear-all-trades` |
+| Clear & reseed trades | POST `/api/clear-and-backfill-all` |
+
+## Roadmap (Potential)
+- Client hash-based dedup (instead of id|time) for WS preview rows.
+- Position change flashing / diff highlighting.
+- Persistent user display preferences (time mode, column order).
+- Compression or delta packing for high-volume WS scenarios.
+
+---
+Feel free to open issues or adapt for multi-tenant use; current design assumes a controlled address list and moderate real-time event volume.

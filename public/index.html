@@ -51,21 +51,26 @@
       </div>
 
       <div class="card" aria-labelledby="tradesTitle">
-        <div class="flex space-between mb-2" style="align-items:center; gap:8px;">
-          <h3 id="tradesTitle" style="margin:0">Latest Trades (BTC)</h3>
-          <div class="row">
-            <label class="small muted" for="addrFilter">Address</label>
-            <select id="addrFilter">
-              <option value="">All</option>
-            </select>
-            <label class="small muted" for="timeModeSel">Time</label>
-            <select id="timeModeSel">
-              <option value="absolute">Absolute</option>
-              <option value="relative" selected>Relative</option>
-            </select>
-            <button id="refreshTradesBtn" aria-label="Refresh latest trades">Refresh</button>
-            <button id="loadMoreBtn" aria-label="Load older trades">Load more</button>
-            <button id="backfillBtn" aria-label="Backfill trades">Backfill</button>
+        <div class="flex space-between mb-2 trades-header">
+          <h3 id="tradesTitle" style="margin:0">BTC Fills (All Tracked)</h3>
+          <div class="trades-controls">
+            <div class="control-field">
+              <label class="small muted" for="timeModeSel">Time</label>
+              <select id="timeModeSel">
+                <option value="absolute">Absolute</option>
+                <option value="relative" selected>Relative</option>
+              </select>
+            </div>
+            <div class="control-field grow">
+              <label class="small muted" for="tradesAddressFilter">Address</label>
+              <select id="tradesAddressFilter" aria-label="Filter fills by address">
+                <option value="">All addresses</option>
+              </select>
+            </div>
+            <div class="control-actions">
+              <button id="clearAllBtn" aria-label="Delete all stored trades without backfilling">🗑️ Clear</button>
+              <button id="refreshAllBtn" class="btn-primary" aria-label="Clear all stored trades then fetch fresh fills for all addresses">🔄 Refresh All</button>
+            </div>
           </div>
         </div>
         <table style="width:100%;">
@@ -85,39 +90,181 @@
       </div>
     </div>
 
-    <script>
-      const addrInput = document.getElementById('addrInput');
+    <script type="module">
+      import { mergeTrades, canLoadMore } from './app.js';
+  const addrInput = document.getElementById('addrInput');
       const addBtn = document.getElementById('addBtn');
       const addMsg = document.getElementById('addMsg');
       const positionsTbody = document.getElementById('positionsTbody');
       const tradesTbody = document.getElementById('tradesTbody');
-      const refreshTradesBtn = document.getElementById('refreshTradesBtn');
-      const loadMoreBtn = document.getElementById('loadMoreBtn');
-      const backfillBtn = document.getElementById('backfillBtn');
-      const addrFilterSel = document.getElementById('addrFilter');
+      const tradesAddressFilter = document.getElementById('tradesAddressFilter');
+  const refreshAllBtn = document.getElementById('refreshAllBtn');
+  const clearAllBtn = document.getElementById('clearAllBtn');
+  // Infinite scroll sentinel
+  const tradeSentinel = document.createElement('div');
+  tradeSentinel.id = 'tradeSentinel';
+  tradeSentinel.className = 'sentinel';
+  tradeSentinel.innerHTML = '<span class="small muted">Loading more…</span>';
+  document.querySelector('.card[aria-labelledby="tradesTitle"]').appendChild(tradeSentinel);
       const timeModeSel = document.getElementById('timeModeSel');
       const btcPriceSpan = document.getElementById('btcPrice');
       const ipInfoLink = document.getElementById('ipInfoLink');
       let posSort = { key: 'updated', dir: 'desc' };
       let tradeSort = { key: 'time', dir: 'desc' };
-      let tradesState = { items: [], nextBeforeId: null };
-      let selectedAddress = '';
+  let tradesState = { items: [], nextCursor: null, loadingMore: false, observer: null, rate: { lastAt: 0 }, latestSeq: 0, addressFilter: '' };
+      // Toast system
+      const toastContainer = document.createElement('div');
+      toastContainer.className = 'toast-container';
+      document.body.appendChild(toastContainer);
+      function showToast(message, opts = {}) {
+        const t = document.createElement('div');
+        t.className = 'toast ' + (opts.type || '');
+        t.innerHTML = `<span>${escapeHtml(message)}</span><span class="close-btn" aria-label="Close">✕</span>`;
+        const close = () => { t.style.opacity = '0'; setTimeout(()=> t.remove(), 220); };
+        t.querySelector('.close-btn').addEventListener('click', close);
+        toastContainer.appendChild(t);
+        setTimeout(close, opts.ttl || 4200);
+      }
       let nickMap = {};
+      let knownAddresses = [];
       let timeMode = 'relative';
+  let refreshing = false;
+      let relativeTimeTimer = null;
+
+      const normalizeAddress = (addr) => (typeof addr === 'string' ? addr.trim().toLowerCase() : '');
+
+      async function refreshNicknames() {
+        try {
+          const r = await fetch('/api/addresses');
+          const data = await r.json();
+          const addrList = Array.isArray(data.addresses) ? data.addresses : [];
+          const nicknames = data.nicknames || {};
+          const normalizedBook = {};
+          Object.keys(nicknames).forEach((key) => {
+            const norm = normalizeAddress(key);
+            if (norm) normalizedBook[norm] = String(nicknames[key]);
+          });
+          nickMap = normalizedBook;
+          const seen = new Set();
+          knownAddresses = [];
+          addrList.forEach((addr) => {
+            const display = String(addr || '').trim();
+            const norm = normalizeAddress(display);
+            if (!norm || seen.has(norm)) return;
+            seen.add(norm);
+            knownAddresses.push({ value: norm, label: display });
+          });
+          renderAddressFilterOptions();
+          renderTrades(tradesState.items);
+        } catch (e) {
+          console.warn('failed to refresh nicknames', e);
+        }
+      }
+
+      function renderAddressFilterOptions() {
+        if (!tradesAddressFilter) return;
+        const current = tradesState.addressFilter || '';
+        const exists = !current || knownAddresses.some((entry) => entry.value === current);
+        tradesAddressFilter.innerHTML = '';
+        const defaultOpt = document.createElement('option');
+        defaultOpt.value = '';
+        defaultOpt.textContent = 'All addresses';
+        tradesAddressFilter.appendChild(defaultOpt);
+        knownAddresses.forEach(({ value, label }) => {
+          const opt = document.createElement('option');
+          opt.value = value;
+          const nick = nickMap[value];
+          opt.textContent = nick ? `${nick} (${label})` : label || value;
+          tradesAddressFilter.appendChild(opt);
+        });
+        tradesAddressFilter.value = exists ? current : '';
+        if (!exists && current) {
+          tradesState.addressFilter = '';
+          tradesAddressFilter.value = '';
+          void loadInitialTrades(300);
+        }
+      }
 
       async function fetchPositions() {
         const r = await fetch('/api/current-positions');
         return (await r.json()).positions || [];
       }
 
-      async function fetchLatestTrades(limit = 50) {
-        const r = await fetch(`/api/latest-trades?limit=${limit}`);
-        return (await r.json()).trades || [];
+      async function fetchAllTrades(limit = 1000, cursor = null, address = null) {
+        const url = new URL('/api/latest-trades', location.origin);
+        url.searchParams.set('limit', limit);
+        if (cursor?.beforeAt) url.searchParams.set('beforeAt', cursor.beforeAt);
+        if (cursor?.beforeId != null) url.searchParams.set('beforeId', cursor.beforeId);
+        if (address) url.searchParams.set('address', address);
+        const r = await fetch(url.toString());
+        const j = await r.json();
+        const nextCursor = j.nextCursor || (j.nextBeforeAt ? { beforeAt: j.nextBeforeAt, beforeId: j.nextBeforeId ?? null } : null);
+        return { trades: j.trades || [], nextCursor };
       }
 
       async function fetchPrice() {
         const r = await fetch('/api/price');
         return await r.json();
+      }
+
+      async function loadInitialTrades(limit = 300) {
+        if (!tradeSentinel) return;
+        tradesState.loadingMore = true;
+        tradeSentinel.classList.add('loading');
+        tradeSentinel.innerHTML = '<span class="small muted">Loading fills…</span>';
+        showSkeletonRows();
+        try {
+          const { trades, nextCursor } = await fetchAllTrades(limit, null, tradesState.addressFilter || null);
+          tradesState.items = trades;
+          tradesState.nextCursor = nextCursor;
+          renderTrades(tradesState.items);
+          updateTradeSentinelIdle();
+          initInfiniteScroll();
+        } catch (e) {
+          console.error('initial trades load failed', e);
+          showToast('Failed to load fills', { type: 'error' });
+        } finally {
+          tradesState.loadingMore = false;
+          tradeSentinel.classList.remove('loading');
+          removeSkeletonRows();
+        }
+      }
+
+      function updateTradeSentinelIdle() {
+        if (!tradeSentinel) return;
+        if (tradesState.nextCursor) {
+          tradeSentinel.innerHTML = '<span class="small muted">Loading more…</span>';
+          return;
+        }
+        const suffix = tradesState.addressFilter ? ' for this address' : '';
+        if (tradesState.items.length === 0) {
+          tradeSentinel.innerHTML = `<span class="small muted">No fills${suffix}</span>`;
+        } else {
+          tradeSentinel.innerHTML = `<span class="small muted">No more fills${suffix}</span>`;
+        }
+      }
+
+      function refreshRelativeTradeTimes() {
+        if (timeMode !== 'relative') return;
+        document.querySelectorAll('td.trade-time[data-time]').forEach((td) => {
+          const iso = td.getAttribute('data-time');
+          if (iso) td.textContent = formatTime(iso);
+        });
+      }
+
+      function ensureRelativeTimeTicker() {
+        if (relativeTimeTimer) return;
+        relativeTimeTimer = setInterval(() => {
+          refreshRelativeTradeTimes();
+        }, 30000);
+      }
+      ensureRelativeTimeTicker();
+
+      async function applyAddressFilter(value) {
+        const normalized = normalizeAddress(value);
+        if (tradesState.addressFilter === normalized) return;
+        tradesState.addressFilter = normalized;
+        await loadInitialTrades(300);
       }
 
       function renderPositions(positions) {
@@ -152,8 +299,8 @@
             <td class="small muted">${formatTime(p.updatedAt)}</td>
           `;
           tr.querySelector('a[data-address]')?.addEventListener('click', (e) => { e.preventDefault(); showHoldings(p.address); });
-          tr.querySelector('a[data-action="remove"]')?.addEventListener('click', async (e) => { e.preventDefault(); await removeAddress(p.address); await refresh(); });
-          tr.querySelector('a[data-action="edit-nick"]')?.addEventListener('click', async (e) => { e.preventDefault(); await editNickname(p.address, p.nickname || ''); await refresh(); });
+          tr.querySelector('a[data-action="remove"]')?.addEventListener('click', async (e) => { e.preventDefault(); await removeAddress(p.address); await refresh(); await refreshNicknames(); });
+          tr.querySelector('a[data-action="edit-nick"]')?.addEventListener('click', async (e) => { e.preventDefault(); await editNickname(p.address, p.nickname || ''); await refresh(); await refreshNicknames(); });
           // Add external Hyperbot link in actions
           (function(){ return;
             const actions = tr.querySelector('td .small');
@@ -173,18 +320,22 @@
         });
       }
 
-      function renderTrades(trades, { append } = { append: false }) {
+      function renderTrades(trades) {
         trades = sortTrades(trades);
-        if (!append) tradesTbody.innerHTML = '';
+        tradesTbody.innerHTML = '';
         trades.forEach(t => {
           const tr = document.createElement('tr');
           const pnl = (typeof t.closedPnl === 'number' && isFinite(t.closedPnl)) ? t.closedPnl : null;
           const pnlTxt = pnl !== null ? formatUsd(pnl) : '-';
           const pnlClass = pnl !== null ? (pnl >= 0 ? 'score positive' : 'score negative') : '';
-          const nick = nickMap && nickMap[t.address] ? String(nickMap[t.address]) : '';
-          const addrHtml = nick ? (`<strong>${escapeHtml(nick)}</strong><div class="small muted">${t.address}</div>`) : `<span class="addr">${t.address}</span>`;
+          const addrKey = normalizeAddress(t.address);
+          const nick = addrKey && nickMap ? nickMap[addrKey] : null;
+          const addrText = t.address || addrKey || '-';
+          const addrHtml = nick
+            ? (`<strong>${escapeHtml(nick)}</strong><div class="small muted">${addrText}</div>`)
+            : `<span class="addr">${addrText}</span>`;
           tr.innerHTML = `
-            <td class="small muted">${formatTime(t.time)}</td>
+            <td class="small muted trade-time" data-time="${t.time || ''}">${formatTime(t.time)}</td>
             <td>${addrHtml}</td>
             <td>${escapeHtml(t.action || '')}</td>
             <td>${Number(t.size).toFixed(5)}</td>
@@ -194,6 +345,8 @@
           `;
           tradesTbody.appendChild(tr);
         });
+        refreshRelativeTradeTimes();
+        updateTradeSentinelIdle();
       }
 
       function sortPositions(positions) {
@@ -238,6 +391,137 @@
           console.error('refresh failed', e);
         }
       }
+
+      async function fullRefreshAllFills() {
+        if (refreshing) return;
+        refreshing = true;
+        refreshAllBtn.disabled = true;
+        refreshAllBtn.textContent = '⏳ Refreshing...';
+        try {
+          // Step 1: clear all trades and backfill for all addresses
+          const resp = await fetch('/api/clear-and-backfill-all', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+          const j = await resp.json().catch(()=>({}));
+          if (resp.ok) {
+            showToast(`Cleared ${j.deleted || 0}, backfilled ${Object.values(j.perAddress||{}).reduce((a,v)=>a+v.inserted,0)} fills`, { type: 'success' });
+          } else {
+            showToast('Refresh action failed', { type: 'error' });
+          }
+          await loadInitialTrades(500);
+        } catch (e) {
+          console.error('full refresh failed', e);
+          showToast('Failed to refresh fills', { type: 'error' });
+        } finally {
+          refreshing = false;
+          refreshAllBtn.disabled = false;
+          refreshAllBtn.textContent = '🔄 Refresh All';
+        }
+      }
+
+      async function clearAllFillsOnly() {
+        if (refreshing) return;
+        refreshing = true;
+        clearAllBtn.disabled = true;
+        clearAllBtn.textContent = '⏳ Clearing...';
+        try {
+          if (!confirm('Delete ALL stored fills? This cannot be undone.')) { throw new Error('cancelled'); }
+          const r = await fetch('/api/clear-all-trades', { method: 'POST' });
+          const j = await r.json().catch(()=>({}));
+          if (!r.ok) throw new Error('clear failed');
+          tradesState.items = [];
+          tradesState.nextCursor = null;
+          renderTrades([]);
+          updateTradeSentinelIdle();
+          showToast(`Deleted ${j.deleted || 0} fills from DB`, { type: 'success' });
+        } catch (e) {
+          console.error('clear all fills failed', e);
+          if (String(e.message) === 'cancelled') {
+            showToast('Clear cancelled', { type: 'error', ttl: 1800 });
+          } else {
+            showToast('Failed to clear fills', { type: 'error' });
+          }
+        } finally {
+          refreshing = false;
+          clearAllBtn.disabled = false;
+          clearAllBtn.textContent = '🗑️ Clear';
+        }
+      }
+
+      async function loadMoreFills() {
+        if (tradesState.loadingMore) return;
+        if (!tradesState.nextCursor) {
+          updateTradeSentinelIdle();
+          if (tradesState.observer) tradesState.observer.disconnect();
+          return;
+        }
+        // Rate limit to prevent rapid triggering
+        if (!canLoadMore(tradesState.rate, 800)) return;
+        tradesState.loadingMore = true;
+        tradeSentinel.classList.add('loading');
+        tradeSentinel.innerHTML = '<span class="small muted">Loading more…</span>';
+        showSkeletonRows();
+        try {
+          const { trades, nextCursor } = await fetchAllTrades(200, tradesState.nextCursor, tradesState.addressFilter || null);
+          if (trades.length === 0) {
+            tradesState.nextCursor = null;
+            updateTradeSentinelIdle();
+            if (tradesState.observer) tradesState.observer.disconnect();
+            showToast('Reached oldest fills', { type: 'success', ttl: 2500 });
+          } else {
+            const beforeCount = tradesState.items.length;
+            tradesState.items = mergeTrades(tradesState.items, trades);
+            const newCount = Math.max(0, tradesState.items.length - beforeCount);
+            tradesState.nextCursor = nextCursor;
+            renderTrades(tradesState.items);
+            showToast(`Loaded ${newCount} older fills`, { type: 'success' });
+            updateTradeSentinelIdle();
+          }
+        } catch (e) {
+          console.error('load more failed', e);
+          showToast('Failed to load more fills', { type: 'error' });
+          tradeSentinel.innerHTML = '<span class="small muted">Load error – retry scrolling</span>';
+        } finally {
+          tradesState.loadingMore = false;
+          tradeSentinel.classList.remove('loading');
+          removeSkeletonRows();
+        }
+      }
+
+      function initInfiniteScroll() {
+        if (tradesState.observer) tradesState.observer.disconnect();
+        const opts = { root: null, rootMargin: '0px', threshold: 0.1 };
+        tradesState.observer = new IntersectionObserver((entries) => {
+          for (const e of entries) {
+            if (e.isIntersecting) {
+              loadMoreFills();
+            }
+          }
+        }, opts);
+        tradesState.observer.observe(tradeSentinel);
+      }
+
+      function showSkeletonRows(count = 6) {
+        removeSkeletonRows();
+        for (let i=0;i<count;i++) {
+          const tr = document.createElement('tr');
+          tr.className = 'skeleton-row';
+          for (let c=0;c<7;c++) {
+            const td = document.createElement('td');
+            const sk = document.createElement('span');
+            sk.className = 'skeleton';
+            td.appendChild(sk);
+            tr.appendChild(td);
+          }
+          tradesTbody.appendChild(tr);
+        }
+      }
+      function removeSkeletonRows() {
+        document.querySelectorAll('.skeleton-row').forEach(r=>r.remove());
+      }
+
+      // Accessibility: aria-live regions
+      toastContainer.setAttribute('aria-live','polite');
+      toastContainer.setAttribute('role','status');
+      tradeSentinel.setAttribute('aria-live','polite');
 
       async function refreshPrice() {
         try {
@@ -287,6 +571,7 @@
           addMsg.textContent = 'Added';
           setTimeout(() => (addMsg.textContent = ''), 1200);
           await refresh();
+          await refreshNicknames();
         } catch (e) {
           addMsg.textContent = 'Network error';
         }
@@ -386,6 +671,11 @@
         });
       });
 
+  // Refresh, clear & pagination handlers
+  refreshAllBtn.addEventListener('click', fullRefreshAllFills);
+  clearAllBtn.addEventListener('click', clearAllFillsOnly);
+  // Infinite scroll initialization after first load handled below
+
       // Initial load and polling
       refresh();
       setInterval(refresh, 5000);
@@ -394,74 +684,75 @@
       // Initial IP info + periodic UI refresh (server fetch interval is independent)
       refreshIpDisplay();
       setInterval(refreshIpDisplay, 60000);
-      async function loadTradesPage({ reset } = { reset: false }) {
-        try {
-          const params = new URLSearchParams();
-          params.set('limit', '100');
-          if (!reset && tradesState.nextBeforeId) params.set('beforeId', String(tradesState.nextBeforeId));
-          if (selectedAddress) params.set('address', selectedAddress);
-          const r = await fetch('/api/latest-trades?'+params.toString());
-          const j = await r.json();
-          const items = j.trades || [];
-          const nextBeforeId = j.nextBeforeId || null;
-          if (reset) {
-            tradesState.items = items;
-            tradesState.nextBeforeId = nextBeforeId;
-            renderTrades(tradesState.items);
-          } else {
-            tradesState.items = (tradesState.items || []).concat(items);
-            tradesState.nextBeforeId = nextBeforeId;
-            renderTrades(items, { append: true });
-          }
-          loadMoreBtn.disabled = !tradesState.nextBeforeId;
-        } catch (e) { /* ignore */ }
-      }
-
-      refreshTradesBtn.addEventListener('click', () => loadTradesPage({ reset: true }));
-      loadMoreBtn.addEventListener('click', () => loadTradesPage({ reset: false }));
-      backfillBtn.addEventListener('click', async () => {
-        backfillBtn.disabled = true;
-        try {
-          // Backfill for selected address or all if none selected
-          if (selectedAddress) {
-            await fetch('/api/backfill', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address: selectedAddress }) });
-          } else {
-            const doAll = confirm('Backfill all addresses (will cleanup invalid trades first)?');
-            if (doAll) {
-              await fetch('/api/cleanup-and-backfill', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ limit: 100 }) });
+      // Initial trades load (current stored trades)
+  (async () => {
+    await refreshNicknames();
+    await loadInitialTrades(300);
+  })();
+  // Real-time WebSocket client
+  let ws; let wsRetry = 0;
+  function connectWS() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.addEventListener('open', () => { wsRetry = 0; ws.send(JSON.stringify({ since: tradesState.latestSeq || 0 })); });
+    ws.addEventListener('message', (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'events' || msg.type === 'batch') {
+          const evs = msg.events || [];
+          let tradeAdditions = [];
+          for (const ev of evs) {
+            if (ev.type === 'trade') {
+              const normAddr = normalizeAddress(ev.address);
+              if (tradesState.addressFilter && normAddr !== tradesState.addressFilter) {
+                continue;
+              }
+              tradeAdditions.push({
+                id: ev.dbId ?? ev.seq,
+                time: ev.at,
+                address: ev.address,
+                action: ev.action || (ev.side === 'buy' ? 'Buy' : 'Sell'),
+                size: ev.size,
+                startPosition: ev.startPosition ?? null,
+                price: ev.priceUsd,
+                closedPnl: ev.realizedPnlUsd ?? null,
+                tx: ev.hash ?? null,
+              });
             }
           }
-          await loadTradesPage({ reset: true });
-        } catch (e) { /* ignore */ } finally { backfillBtn.disabled = false; }
-      });
-      // No separate cleanup-all button; Backfill does per-address or global backfill
-      timeModeSel.addEventListener('change', () => {
-        timeMode = timeModeSel.value === 'relative' ? 'relative' : 'absolute';
-        renderTrades(tradesState.items);
-      });
-      addrFilterSel.addEventListener('change', () => {
-        selectedAddress = addrFilterSel.value;
-        loadTradesPage({ reset: true });
-      });
-      async function populateAddressFilter() {
-        try {
-          const r = await fetch('/api/addresses');
-          const j = await r.json();
-          const addresses = j.addresses || [];
-          nickMap = j.nicknames || {};
-          addrFilterSel.innerHTML = '<option value="">All</option>';
-          addresses.forEach(a => {
-            const opt = document.createElement('option');
-            const label = nickMap[a] ? `${nickMap[a]} (${a.slice(0,6)}...${a.slice(-4)})` : a;
-            opt.value = a; opt.textContent = label;
-            addrFilterSel.appendChild(opt);
-          });
-        } catch (e) {}
-      }
-      populateAddressFilter();
-      // Ensure UI reflects default time mode on load
+          if (tradeAdditions.length) {
+            const beforeCount = tradesState.items.length;
+            tradesState.items = mergeTrades(tradesState.items, tradeAdditions);
+            // Only re-render the new items at top for efficiency
+            renderTrades(tradesState.items);
+            const newCount = tradesState.items.length - beforeCount;
+            if (newCount > 0) {
+              // Flash first few new rows
+              const rows = tradesTbody.querySelectorAll('tr');
+              for (let i=0; i<Math.min(newCount, 5); i++) {
+                rows[i]?.classList.add('flash-new');
+              }
+            }
+          }
+          if (evs.length) { tradesState.latestSeq = evs[evs.length - 1].seq; }
+        }
+      } catch (err) { /* ignore */ }
+    });
+    ws.addEventListener('close', () => {
+      const timeout = Math.min(1000 * Math.pow(2, wsRetry), 15000);
+      wsRetry += 1;
+      setTimeout(connectWS, timeout);
+    });
+    ws.addEventListener('error', () => { try { ws.close(); } catch {}; });
+  }
+  connectWS();
       if (timeModeSel) timeModeSel.value = timeMode;
-      loadTradesPage({ reset: true });
+      timeModeSel.addEventListener('change', () => { timeMode = timeModeSel.value; renderTrades(tradesState.items); });
+      if (tradesAddressFilter) {
+        tradesAddressFilter.addEventListener('change', async () => {
+          await applyAddressFilter(tradesAddressFilter.value || '');
+        });
+      }
 
       function formatUsd(n) {
         if (typeof n !== 'number' || !isFinite(n)) return '-';
@@ -470,6 +761,7 @@
         } catch { return '$' + n.toFixed(2); }
       }
       function formatTime(iso) {
+        if (!iso) return '-';
         const d = new Date(iso);
         if (timeMode === 'relative') {
           const diffMs = Date.now() - d.getTime();

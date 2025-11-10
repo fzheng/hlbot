@@ -21,35 +21,47 @@ function sideFromSize(size: number): 'long' | 'short' | 'flat' {
 }
 
 export class RealtimeTracker {
-  private ws: any; // WebSocketTransport
+  private ws: any; // shared WebSocketTransport for clearinghouseState
   private http: any; // HttpTransport
-  private subs: Map<Address, { ch?: any; ue?: any }>; // clearinghouse + userEvents
+  private wsImpl: any; // WS ctor from 'ws' (lazy)
+  private subs: Map<Address, { ch?: any; ue?: any; ueTransport?: any }>; // subs + per-address UE transport
   private snapshots: Map<Address, { data: PositionSnapshot; updatedAt: string }>;
   private getAddresses: () => Promise<Address[]>;
   private q: EventQueue;
+  private primeInflight: Map<Address, Promise<void>>;
+  private lastPrimeAt: Map<Address, number>;
 
   constructor(getAddresses: () => Promise<Address[]>, queue: EventQueue) {
     this.getAddresses = getAddresses;
     this.q = queue;
     this.subs = new Map();
     this.snapshots = new Map();
+    this.primeInflight = new Map();
+    this.lastPrimeAt = new Map();
   }
 
   async start() {
+    await this.ensureSharedTransports();
+    await this.refresh();
+  }
+
+  private async ensureSharedTransports() {
+    if (!this.wsImpl) {
+      this.wsImpl = (await import('ws')).default as any;
+    }
     if (!this.ws) {
-      const WS = (await import('ws')).default as any;
-      this.ws = new (hl as any).WebSocketTransport({ reconnect: { WebSocket: WS } });
+      this.ws = new (hl as any).WebSocketTransport({ reconnect: { WebSocket: this.wsImpl } });
     }
     if (!this.http) {
       this.http = new (hl as any).HttpTransport();
     }
-    await this.refresh();
   }
 
   async stop() {
     for (const [, s] of this.subs) {
       try { await s.ch?.unsubscribe?.(); } catch {}
       try { await s.ue?.unsubscribe?.(); } catch {}
+      try { await s.ueTransport?.close?.(); } catch {}
     }
     this.subs.clear();
   }
@@ -64,6 +76,7 @@ export class RealtimeTracker {
         const s = this.subs.get(addr);
         try { await s?.ch?.unsubscribe?.(); } catch {}
         try { await s?.ue?.unsubscribe?.(); } catch {}
+        try { await s?.ueTransport?.close?.(); } catch {}
         this.subs.delete(addr);
         this.snapshots.delete(addr);
       }
@@ -78,8 +91,9 @@ export class RealtimeTracker {
   }
 
   private async subscribeAddress(addr: Address) {
+    await this.ensureSharedTransports();
     const user = addr as `0x${string}`;
-    const subs: { ch?: any; ue?: any } = {};
+    const subs: { ch?: any; ue?: any; ueTransport?: any } = {};
 
     // clearinghouseState: position snapshots and updates
     try {
@@ -95,17 +109,23 @@ export class RealtimeTracker {
 
     // userEvents: fills/trades
     try {
+      const ueTransport = new (hl as any).WebSocketTransport({ reconnect: { WebSocket: this.wsImpl } });
+      subs.ueTransport = ueTransport;
       subs.ue = await subUserEvents(
-        { transport: this.ws },
+        { transport: ueTransport },
         { user },
         (evt: any) => this.onUserEvents(addr, evt)
       );
     } catch (e) {
+      try { await subs.ueTransport?.close?.(); } catch {}
       // eslint-disable-next-line no-console
       console.warn('[realtime] userEvents sub failed for', addr, e);
     }
 
     this.subs.set(addr, subs);
+    if (!this.snapshots.has(addr)) {
+      void this.primeFromHttp(addr);
+    }
   }
 
   private onClearinghouse(addr: Address, evt: any) {
@@ -172,11 +192,12 @@ export class RealtimeTracker {
     }
   }
 
-  private onUserEvents(addr: Address, evt: any) {
+  private async onUserEvents(addr: Address, evt: any) {
     try {
       // We care about FillEvent variant: { fills: [...] }
       if (!evt || !('fills' in evt)) return;
       const fills: any[] = Array.isArray(evt.fills) ? evt.fills : [];
+      let touched = false;
       for (const f of fills) {
         const coin = f?.coin ?? '';
         if (!/^btc$/i.test(String(coin))) continue;
@@ -208,6 +229,20 @@ export class RealtimeTracker {
           else actionLabel = newPos === 0 ? 'Close Short' : 'Decrease Short';
         }
 
+        const persistencePayload = {
+          at,
+          address: addr,
+          symbol: 'BTC',
+          action: actionLabel,
+          size: Math.abs(sz),
+          startPosition,
+          priceUsd: px,
+          realizedPnlUsd: Number.isFinite(realizedPnl) ? realizedPnl : null,
+          fee,
+          feeToken,
+          hash,
+        };
+        const persistResult = await insertTradeIfNew(addr, persistencePayload);
         const evt = this.q.push({
           type: 'trade',
           at,
@@ -224,9 +259,12 @@ export class RealtimeTracker {
           feeToken,
           hash,
           action: actionLabel,
+          dbId: persistResult.id ?? undefined,
         });
-        // Prefer dedup/upsert by tx hash to allow later aggregated backfills to overwrite partial WS slices
-        void insertTradeIfNew(addr, evt);
+        touched = true;
+      }
+      if (touched) {
+        void this.primeFromHttp(addr, { force: false, minIntervalMs: 2000 });
       }
     } catch (e) {
       // eslint-disable-next-line no-console
@@ -279,8 +317,27 @@ export class RealtimeTracker {
   }
 
   // Immediate prime via HTTP info API for newly added addresses
-  async primeFromHttp(addr: Address) {
+  async primeFromHttp(addr: Address, opts?: { force?: boolean; minIntervalMs?: number }): Promise<void> {
+    const { force = true, minIntervalMs = 0 } = opts || {};
+    const inflight = this.primeInflight.get(addr);
+    if (inflight) return inflight;
+    if (!force && minIntervalMs > 0) {
+      const last = this.lastPrimeAt.get(addr) ?? 0;
+      if (Date.now() - last < minIntervalMs) return Promise.resolve();
+    }
+    const task = this.performPrime(addr).finally(() => {
+      this.lastPrimeAt.set(addr, Date.now());
+      this.primeInflight.delete(addr);
+    });
+    this.primeInflight.set(addr, task);
+    return task;
+  }
+
+  private async performPrime(addr: Address): Promise<void> {
     try {
+      if (!this.http) {
+        this.http = new (hl as any).HttpTransport();
+      }
       const user = addr as `0x${string}`;
       const data = await infoClearinghouse(
         { transport: this.http },
@@ -333,6 +390,24 @@ export class RealtimeTracker {
       });
     } catch (_e) {
       // ignore
+    }
+  }
+
+  async ensureFreshSnapshots(maxAgeMs = 60000): Promise<void> {
+    try {
+      const addrs = (await this.getAddresses()).map((a) => a.toLowerCase());
+      const now = Date.now();
+      const tasks: Promise<void>[] = [];
+      for (const addr of addrs) {
+        const snap = this.snapshots.get(addr);
+        const updatedMs = snap?.updatedAt ? Date.parse(snap.updatedAt) : NaN;
+        if (!snap || !Number.isFinite(updatedMs) || now - updatedMs > maxAgeMs) {
+          tasks.push(this.primeFromHttp(addr, { force: true }));
+        }
+      }
+      if (tasks.length) await Promise.allSettled(tasks);
+    } catch {
+      // best-effort safeguard; ignore failures
     }
   }
 }
